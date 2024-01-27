@@ -50,7 +50,8 @@ impl BaseVulkanState {
             .enable_validation_layers(enable_validation_layers)
             .build();
 
-        let debug_messenger = DebugMessenger::new(&entry, instance.clone());
+        let debug_messenger =
+            DebugMessenger::new(&entry, instance.clone(), enable_validation_layers);
 
         let surface = VulkanSurface::new(
             &entry,

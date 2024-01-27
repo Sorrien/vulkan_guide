@@ -5,28 +5,34 @@ use std::ffi::CStr;
 use std::sync::Arc;
 
 pub struct DebugMessenger {
-    instance: Arc<crate::ash_bootstrap::Instance>,
     pub debug_messenger: vk::DebugUtilsMessengerEXT,
     pub debug_utils: DebugUtils,
+    use_debug: bool,
 }
 
 impl DebugMessenger {
-    pub fn new(entry: &Entry, instance: Arc<crate::ash_bootstrap::Instance>) -> Self {
-        let (debug_utils, debug_messenger) = debug_utils(entry, &instance.handle);
+    pub fn new(
+        entry: &Entry,
+        instance: Arc<crate::ash_bootstrap::Instance>,
+        use_debug: bool,
+    ) -> Self {
+        let (debug_utils, debug_messenger) = debug_utils(entry, &instance.handle, use_debug);
         Self {
-            instance,
             debug_messenger,
             debug_utils,
+            use_debug,
         }
     }
 }
 
 impl Drop for DebugMessenger {
     fn drop(&mut self) {
-        unsafe {
-            self.debug_utils
-                .destroy_debug_utils_messenger(self.debug_messenger, None)
-        };
+        if self.use_debug {
+            unsafe {
+                self.debug_utils
+                    .destroy_debug_utils_messenger(self.debug_messenger, None)
+            };
+        }
     }
 }
 
@@ -63,13 +69,15 @@ unsafe extern "system" fn vulkan_debug_callback(
 pub fn debug_utils(
     entry: &Entry,
     instance: &ash::Instance,
+    use_debug: bool,
 ) -> (DebugUtils, vk::DebugUtilsMessengerEXT) {
     let debug_utils_loader = DebugUtils::new(entry, &instance);
 
-    #[cfg(feature = "validation_layers")]
-    let debug_call_back = create_debug_callback(&debug_utils_loader);
-    #[cfg(not(feature = "validation_layers"))]
-    let debug_call_back = ash::vk::DebugUtilsMessengerEXT::null();
+    let debug_call_back = if use_debug {
+        create_debug_callback(&debug_utils_loader)
+    } else {
+        ash::vk::DebugUtilsMessengerEXT::null()
+    };
 
     (debug_utils_loader, debug_call_back)
 }

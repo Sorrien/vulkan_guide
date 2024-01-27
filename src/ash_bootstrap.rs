@@ -12,7 +12,6 @@ use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use crate::{debug, swapchain::SwapchainSupportDetails};
 
 pub struct VulkanSurface {
-    instance: Arc<crate::ash_bootstrap::Instance>,
     pub loader: Surface,
     pub handle: vk::SurfaceKHR,
 }
@@ -37,7 +36,6 @@ impl VulkanSurface {
 
         if let Ok(surface) = surface_result {
             Ok(Arc::new(Self {
-                instance,
                 loader: surface_loader,
                 handle: surface,
             }))
