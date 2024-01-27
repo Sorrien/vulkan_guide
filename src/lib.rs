@@ -1,18 +1,14 @@
-use std::ffi::CString;
+use std::{ffi::CString, sync::Arc};
 
-use ash::{
-    extensions::{
-        ext::DebugUtils,
-        khr::{Surface, Swapchain},
-    },
-    vk::{self, Device},
-};
+use ash::{extensions::khr::Swapchain, vk};
 use ash_bootstrap::{
-    create_logical_device, BootstrapSwapchain, InstanceBuilder, PhysicalDeviceSelector,
-    QueueFamilyIndices, SwapchainBuilder, SwapchainSupportDetails,
+    Instance, InstanceBuilder, LogicalDevice, PhysicalDeviceSelector, QueueFamilyIndices,
+    VulkanSurface,
 };
+use debug::DebugMessenger;
 //use gpu_allocator::vulkan::*;
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
+use swapchain::{MySwapchain, SwapchainBuilder, SwapchainSupportDetails};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::EventLoop,
@@ -21,22 +17,21 @@ use winit::{
 
 pub mod ash_bootstrap;
 pub mod debug;
+pub mod swapchain;
 
 const FRAME_OVERLAP: usize = 2;
 
 pub struct BaseVulkanState {
-    pub window: Window,
-    pub instance: ash::Instance,
-    pub physical_device: vk::PhysicalDevice,
-    pub device: ash::Device,
-    pub queue_family_indices: QueueFamilyIndices,
-    pub graphics_queue: vk::Queue,
-    pub surface_loader: Surface,
-    pub surface: vk::SurfaceKHR,
-    pub swapchain_support: SwapchainSupportDetails,
-    pub debug_messenger: vk::DebugUtilsMessengerEXT,
-    pub debug_utils: DebugUtils,
     pub msaa_samples: vk::SampleCountFlags,
+    pub queue_family_indices: QueueFamilyIndices,
+    pub swapchain_support: SwapchainSupportDetails,
+    pub graphics_queue: vk::Queue,
+    pub device: Arc<LogicalDevice>,
+    pub physical_device: vk::PhysicalDevice,
+    pub debug_messenger: DebugMessenger,
+    pub surface: Arc<VulkanSurface>,
+    pub instance: Arc<Instance>,
+    pub window: Window,
 }
 
 impl BaseVulkanState {
@@ -55,18 +50,14 @@ impl BaseVulkanState {
             .enable_validation_layers(enable_validation_layers)
             .build();
 
-        let (debug_utils, debug_messenger) = crate::debug::debug_utils(&entry, &instance);
+        let debug_messenger = DebugMessenger::new(&entry, instance.clone());
 
-        let surface_loader = Surface::new(&entry, &instance);
-        let surface = unsafe {
-            ash_window::create_surface(
-                &entry,
-                &instance,
-                window.raw_display_handle(),
-                window.raw_window_handle(),
-                None,
-            )
-        }
+        let surface = VulkanSurface::new(
+            &entry,
+            instance.clone(),
+            window.raw_display_handle(),
+            window.raw_window_handle(),
+        )
         .expect("failed to create window surface!");
 
         // Application can't function without geometry shaders or the graphics queue family or anisotropy (we could remove anisotropy)
@@ -80,7 +71,7 @@ impl BaseVulkanState {
             .buffer_device_address(true)
             .descriptor_indexing(true);
 
-        let selector = PhysicalDeviceSelector::new(&instance, &surface_loader, &surface);
+        let selector = PhysicalDeviceSelector::new(instance.clone(), surface.clone());
 
         let required_extensions = vec![CString::from(Swapchain::NAME)];
         let bootstrap_physical_device = selector
@@ -91,8 +82,8 @@ impl BaseVulkanState {
             .select()
             .expect("failed to select physical device!");
 
-        let device = create_logical_device(
-            &instance,
+        let device = LogicalDevice::new(
+            instance.clone(),
             bootstrap_physical_device.physical_device,
             &bootstrap_physical_device.queue_family_indices,
             required_extensions,
@@ -103,7 +94,7 @@ impl BaseVulkanState {
         .expect("failed to create logical device!");
 
         let graphics_queue = unsafe {
-            device.get_device_queue(
+            device.handle.get_device_queue(
                 bootstrap_physical_device
                     .queue_family_indices
                     .graphics_family
@@ -119,20 +110,18 @@ impl BaseVulkanState {
             device,
             queue_family_indices: bootstrap_physical_device.queue_family_indices,
             graphics_queue,
-            surface_loader,
             surface,
             swapchain_support: bootstrap_physical_device.swapchain_support_details,
             debug_messenger,
-            debug_utils,
             msaa_samples: bootstrap_physical_device.max_sample_count,
         }
     }
 
-    pub fn create_swapchain(&self, window_width: u32, window_height: u32) -> BootstrapSwapchain {
+    pub fn create_swapchain(&self, window_width: u32, window_height: u32) -> MySwapchain {
         let bootstrap_swapchain = SwapchainBuilder::new(
             self.instance.clone(),
             self.device.clone(),
-            self.surface,
+            self.surface.clone(),
             self.swapchain_support.clone(),
             self.queue_family_indices,
         )
@@ -156,7 +145,7 @@ impl BaseVulkanState {
             .flags(flags)
             .queue_family_index(self.queue_family_indices.graphics_family.unwrap() as u32);
 
-        unsafe { self.device.create_command_pool(&pool_info, None) }
+        unsafe { self.device.handle.create_command_pool(&pool_info, None) }
     }
 
     pub fn create_command_buffers(
@@ -169,10 +158,10 @@ impl BaseVulkanState {
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(count);
 
-        unsafe { self.device.allocate_command_buffers(&alloc_info) }
+        unsafe { self.device.handle.allocate_command_buffers(&alloc_info) }
     }
 
-    pub fn create_frame_data(&self, count: usize) -> Vec<FrameData> {
+    pub fn create_frame_data(&self, count: usize) -> Vec<Arc<FrameData>> {
         (0..count)
             .map(|_| {
                 let command_pool = self
@@ -191,21 +180,21 @@ impl BaseVulkanState {
                 let render_semaphore = self
                     .create_semaphore(vk::SemaphoreCreateFlags::empty())
                     .expect("failed to create swapchain semaphore!");
-
-                FrameData {
+                FrameData::new(
+                    self.device.clone(),
                     command_pool,
                     command_buffer,
                     render_fence,
                     swapchain_semaphore,
                     render_semaphore,
-                }
+                )
             })
             .collect::<Vec<_>>()
     }
 
     pub fn create_fence(&self, flags: vk::FenceCreateFlags) -> Result<vk::Fence, vk::Result> {
         let fence_create_info = vk::FenceCreateInfo::default().flags(flags);
-        unsafe { self.device.create_fence(&fence_create_info, None) }
+        unsafe { self.device.handle.create_fence(&fence_create_info, None) }
     }
 
     pub fn create_semaphore(
@@ -213,7 +202,7 @@ impl BaseVulkanState {
         flags: vk::SemaphoreCreateFlags,
     ) -> Result<vk::Semaphore, vk::Result> {
         let create_info = vk::SemaphoreCreateInfo::default().flags(flags);
-        unsafe { self.device.create_semaphore(&create_info, None) }
+        unsafe { self.device.handle.create_semaphore(&create_info, None) }
     }
 
     pub fn transition_image_layout(
@@ -251,35 +240,17 @@ impl BaseVulkanState {
 
         unsafe {
             self.device
+                .handle
                 .cmd_pipeline_barrier2(command_buffer, &dependency_info)
         };
     }
 }
 
-impl Drop for BaseVulkanState {
-    fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_device(None);
-            #[cfg(feature = "validation_layers")]
-            self.debug_utils
-                .destroy_debug_utils_messenger(self.debug_messenger, None);
-            self.surface_loader.destroy_surface(self.surface, None);
-            self.instance.destroy_instance(None);
-        }
-    }
-}
-
 pub struct VulkanEngine {
-    base: BaseVulkanState,
-    frames: Vec<FrameData>,
     frame_number: usize,
-
-    pub swapchain: vk::SwapchainKHR,
-    pub swapchain_loader: Swapchain,
-    pub format: vk::Format,
-    pub extent: vk::Extent2D,
-    pub swapchain_images: Vec<vk::Image>,
-    pub swapchain_image_views: Vec<vk::ImageView>,
+    frames: Vec<Arc<FrameData>>,
+    pub swapchain: MySwapchain,
+    base: BaseVulkanState,
 }
 
 impl VulkanEngine {
@@ -299,19 +270,14 @@ impl VulkanEngine {
         let window_height = window_size.height;
         let window_width = window_size.width;
 
-        let bootstrap_swapchain = base_vulkan_state.create_swapchain(window_width, window_height);
+        let swapchain = base_vulkan_state.create_swapchain(window_width, window_height);
 
         Self {
             base: base_vulkan_state,
             frames: vec![],
             frame_number: 0,
 
-            swapchain: bootstrap_swapchain.swapchain,
-            swapchain_loader: bootstrap_swapchain.swapchain_loader,
-            format: bootstrap_swapchain.format,
-            extent: bootstrap_swapchain.extent,
-            swapchain_images: bootstrap_swapchain.swapchain_images,
-            swapchain_image_views: bootstrap_swapchain.swapchain_image_views,
+            swapchain,
         }
     }
 
@@ -334,8 +300,8 @@ impl VulkanEngine {
         (event_loop, window)
     }
 
-    pub fn get_current_frame(&self) -> FrameData {
-        self.frames[self.frame_number % FRAME_OVERLAP]
+    pub fn get_current_frame(&self) -> Arc<FrameData> {
+        self.frames[self.frame_number % FRAME_OVERLAP].clone()
     }
 
     pub fn run(&mut self, event_loop: EventLoop<()>) -> Result<(), winit::error::EventLoopError> {
@@ -348,7 +314,7 @@ impl VulkanEngine {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                unsafe { self.base.device.device_wait_idle() }
+                unsafe { self.base.device.handle.device_wait_idle() }
                     .expect("failed to wait for idle on exit!");
                 elwt.exit()
             }
@@ -379,14 +345,20 @@ impl VulkanEngine {
     pub fn draw(&mut self) {
         let current_frame = self.get_current_frame();
         let fences = [current_frame.render_fence];
-        unsafe { self.base.device.wait_for_fences(&fences, true, u64::MAX) }
-            .expect("failed to wait for render fence!");
-        unsafe { self.base.device.reset_fences(&fences) }.expect("failed to reset render fence!");
+        unsafe {
+            self.base
+                .device
+                .handle
+                .wait_for_fences(&fences, true, u64::MAX)
+        }
+        .expect("failed to wait for render fence!");
+        unsafe { self.base.device.handle.reset_fences(&fences) }
+            .expect("failed to reset render fence!");
 
         //acquire next swapchain image
         let (swapchain_image_index, _) = unsafe {
-            self.swapchain_loader.acquire_next_image(
-                self.swapchain,
+            self.swapchain.swapchain_loader.acquire_next_image(
+                self.swapchain.swapchain,
                 u64::MAX,
                 current_frame.swapchain_semaphore,
                 vk::Fence::null(),
@@ -399,12 +371,13 @@ impl VulkanEngine {
         unsafe {
             self.base
                 .device
+                .handle
                 .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
         }
         .expect("failed to reset command buffer!");
 
         unsafe {
-            self.base.device.begin_command_buffer(
+            self.base.device.handle.begin_command_buffer(
                 cmd,
                 &vk::CommandBufferBeginInfo::default()
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
@@ -412,7 +385,7 @@ impl VulkanEngine {
         }
         .expect("failed to begin command buffer!");
 
-        let swapchain_image = self.swapchain_images[swapchain_image_index as usize];
+        let swapchain_image = self.swapchain.swapchain_images[swapchain_image_index as usize];
         self.base.transition_image_layout(
             cmd,
             swapchain_image,
@@ -431,7 +404,7 @@ impl VulkanEngine {
             .layer_count(vk::REMAINING_ARRAY_LAYERS);
         let ranges = [range];
         unsafe {
-            self.base.device.cmd_clear_color_image(
+            self.base.device.handle.cmd_clear_color_image(
                 cmd,
                 swapchain_image,
                 vk::ImageLayout::GENERAL,
@@ -447,7 +420,8 @@ impl VulkanEngine {
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
 
-        unsafe { self.base.device.end_command_buffer(cmd) }.expect("failed to end command buffer!");
+        unsafe { self.base.device.handle.end_command_buffer(cmd) }
+            .expect("failed to end command buffer!");
 
         //let command_info = Self::command_buffer_submit_info(cmd);
         let command_info = vk::CommandBufferSubmitInfo::default()
@@ -484,7 +458,7 @@ impl VulkanEngine {
         //let submit = Self::submit_info(&command_buffer_infos, &signal_infos, &wait_infos);
         let submits = [submit];
         unsafe {
-            self.base.device.queue_submit2(
+            self.base.device.handle.queue_submit2(
                 self.base.graphics_queue,
                 &submits,
                 current_frame.render_fence,
@@ -492,7 +466,7 @@ impl VulkanEngine {
         }
         .expect("queue command submit failed!");
 
-        let swapchains = [self.swapchain];
+        let swapchains = [self.swapchain.swapchain];
         let render_semaphores = [current_frame.render_semaphore];
         let swapchain_image_indices = [swapchain_image_index];
         let present_info = vk::PresentInfoKHR::default()
@@ -500,7 +474,8 @@ impl VulkanEngine {
             .wait_semaphores(&render_semaphores)
             .image_indices(&swapchain_image_indices);
         unsafe {
-            self.swapchain_loader
+            self.swapchain
+                .swapchain_loader
                 .queue_present(self.base.graphics_queue, &present_info)
         }
         .expect("failed to queue present to swapchain!");
@@ -526,18 +501,6 @@ impl VulkanEngine {
             .command_buffer(command_buffer)
             .device_mask(0)
     }
-
-    /*     pub fn submit_info(
-           command_buffer_info: vk::CommandBufferSubmitInfo,
-           signal_semaphore_info: vk::SemaphoreSubmitInfo,
-           wait_semaphore_info: vk::SemaphoreSubmitInfo,
-       ) -> vk::SubmitInfo2<'static> {
-           vk::SubmitInfo2::default()
-               .wait_semaphore_infos(&[wait_semaphore_info])
-               .signal_semaphore_infos(&[signal_semaphore_info])
-               .command_buffer_infos(&[command_buffer_info])
-       }
-    */
     pub fn submit_info<'a>(
         command_buffer_infos: &'a [vk::CommandBufferSubmitInfo<'a>],
         signal_semaphore_infos: &'a [vk::SemaphoreSubmitInfo<'a>],
@@ -548,54 +511,59 @@ impl VulkanEngine {
             .signal_semaphore_infos(signal_semaphore_infos)
             .command_buffer_infos(command_buffer_infos)
     }
-
-    pub fn destroy_swapchain(&self) {
-        unsafe {
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None)
-        };
-
-        for i in 0..self.swapchain_image_views.len() {
-            let swapchain_image_view = self.swapchain_image_views[i];
-            unsafe {
-                self.base
-                    .device
-                    .destroy_image_view(swapchain_image_view, None)
-            };
-        }
-    }
 }
 
 impl Drop for VulkanEngine {
     fn drop(&mut self) {
-        unsafe { self.base.device.device_wait_idle() }.expect("failed to wait for device idle!");
-
-        for i in 0..self.frames.len() {
-            let frame = self.frames[i];
-            unsafe {
-                self.base
-                    .device
-                    .destroy_command_pool(frame.command_pool, None);
-
-                self.base.device.destroy_fence(frame.render_fence, None);
-                self.base
-                    .device
-                    .destroy_semaphore(frame.render_semaphore, None);
-                self.base
-                    .device
-                    .destroy_semaphore(frame.swapchain_semaphore, None);
-            };
-        }
-
-        self.destroy_swapchain();
+        unsafe { self.base.device.handle.device_wait_idle() }
+            .expect("failed to wait for device idle!");
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct FrameData {
+    device: Arc<LogicalDevice>,
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     render_fence: vk::Fence,
     swapchain_semaphore: vk::Semaphore,
     render_semaphore: vk::Semaphore,
+}
+
+impl FrameData {
+    pub fn new(
+        device: Arc<LogicalDevice>,
+        command_pool: vk::CommandPool,
+        command_buffer: vk::CommandBuffer,
+        render_fence: vk::Fence,
+        swapchain_semaphore: vk::Semaphore,
+        render_semaphore: vk::Semaphore,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            device,
+            command_pool,
+            command_buffer,
+            render_fence,
+            swapchain_semaphore,
+            render_semaphore,
+        })
+    }
+}
+
+impl Drop for FrameData {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .handle
+                .destroy_command_pool(self.command_pool, None);
+
+            self.device.handle.destroy_fence(self.render_fence, None);
+            self.device
+                .handle
+                .destroy_semaphore(self.render_semaphore, None);
+            self.device
+                .handle
+                .destroy_semaphore(self.swapchain_semaphore, None);
+        };
+    }
 }

@@ -1,8 +1,34 @@
 use ash::extensions::ext::DebugUtils;
 use ash::{vk, Entry};
-pub use ash::{Device, Instance};
 use std::borrow::Cow;
 use std::ffi::CStr;
+use std::sync::Arc;
+
+pub struct DebugMessenger {
+    instance: Arc<crate::ash_bootstrap::Instance>,
+    pub debug_messenger: vk::DebugUtilsMessengerEXT,
+    pub debug_utils: DebugUtils,
+}
+
+impl DebugMessenger {
+    pub fn new(entry: &Entry, instance: Arc<crate::ash_bootstrap::Instance>) -> Self {
+        let (debug_utils, debug_messenger) = debug_utils(entry, &instance.handle);
+        Self {
+            instance,
+            debug_messenger,
+            debug_utils,
+        }
+    }
+}
+
+impl Drop for DebugMessenger {
+    fn drop(&mut self) {
+        unsafe {
+            self.debug_utils
+                .destroy_debug_utils_messenger(self.debug_messenger, None)
+        };
+    }
+}
 
 unsafe extern "system" fn vulkan_debug_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -34,7 +60,10 @@ unsafe extern "system" fn vulkan_debug_callback(
     vk::FALSE
 }
 
-pub fn debug_utils(entry: &Entry, instance: &Instance) -> (DebugUtils, vk::DebugUtilsMessengerEXT) {
+pub fn debug_utils(
+    entry: &Entry,
+    instance: &ash::Instance,
+) -> (DebugUtils, vk::DebugUtilsMessengerEXT) {
     let debug_utils_loader = DebugUtils::new(entry, &instance);
 
     #[cfg(feature = "validation_layers")]
