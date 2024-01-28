@@ -1,12 +1,16 @@
-use std::{ffi::CString, sync::Arc};
+use std::{
+    ffi::CString,
+    mem::ManuallyDrop,
+    sync::{Arc, Mutex},
+};
 
-use ash::{extensions::khr::Swapchain, vk};
+use ash::{extensions::khr::Swapchain, vk, Entry};
 use ash_bootstrap::{
     Instance, InstanceBuilder, LogicalDevice, PhysicalDeviceSelector, QueueFamilyIndices,
     VulkanSurface,
 };
 use debug::DebugMessenger;
-//use gpu_allocator::vulkan::*;
+use gpu_allocator::vulkan::*;
 use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
 use swapchain::{MySwapchain, SwapchainBuilder, SwapchainSupportDetails};
 use winit::{
@@ -25,12 +29,14 @@ pub struct BaseVulkanState {
     pub msaa_samples: vk::SampleCountFlags,
     pub queue_family_indices: QueueFamilyIndices,
     pub swapchain_support: SwapchainSupportDetails,
+    pub allocator: Arc<Mutex<Allocator>>,
     pub graphics_queue: vk::Queue,
     pub device: Arc<LogicalDevice>,
     pub physical_device: vk::PhysicalDevice,
     pub debug_messenger: DebugMessenger,
     pub surface: Arc<VulkanSurface>,
     pub instance: Arc<Instance>,
+    pub entry: Entry,
     pub window: Window,
 }
 
@@ -41,7 +47,7 @@ impl BaseVulkanState {
         #[cfg(not(feature = "validation_layers"))]
         let enable_validation_layers = false;
 
-        let entry = ash::Entry::linked();
+        let entry = unsafe { ash::Entry::load() }.expect("vulkan entry failed to load!");
         let instance = InstanceBuilder::new()
             .entry(entry.clone())
             .application_name(application_title)
@@ -103,8 +109,18 @@ impl BaseVulkanState {
                 0,
             )
         };
+        let allocator = Allocator::new(&AllocatorCreateDesc {
+            instance: instance.handle.clone(),
+            device: device.handle.clone(),
+            physical_device: bootstrap_physical_device.physical_device.clone(),
+            debug_settings: Default::default(),
+            buffer_device_address: true, // Ideally, check the BufferDeviceAddressFeatures struct.
+            allocation_sizes: Default::default(),
+        })
+        .expect("failed to create allocator!");
 
         Self {
+            entry,
             window,
             instance,
             physical_device: bootstrap_physical_device.physical_device,
@@ -115,6 +131,7 @@ impl BaseVulkanState {
             swapchain_support: bootstrap_physical_device.swapchain_support_details,
             debug_messenger,
             msaa_samples: bootstrap_physical_device.max_sample_count,
+            allocator: Arc::new(Mutex::new(allocator)),
         }
     }
 
@@ -245,10 +262,112 @@ impl BaseVulkanState {
                 .cmd_pipeline_barrier2(command_buffer, &dependency_info)
         };
     }
+
+    pub fn create_image(
+        &mut self,
+        img_extent: vk::Extent2D,
+        format: vk::Format,
+        tiling: vk::ImageTiling,
+        usage: vk::ImageUsageFlags,
+        memory_location: gpu_allocator::MemoryLocation,
+        mip_levels: u32,
+        num_samples: vk::SampleCountFlags,
+    ) -> (vk::Image, Allocation) {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .extent(img_extent.into())
+            .mip_levels(mip_levels)
+            .array_layers(1)
+            .format(format)
+            .tiling(tiling)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .samples(num_samples);
+
+        let image = unsafe { self.device.handle.create_image(&image_info, None) }
+            .expect("failed to create image!");
+
+        let mem_requirements = unsafe { self.device.handle.get_image_memory_requirements(image) };
+
+        let is_linear = tiling == vk::ImageTiling::LINEAR;
+        let image_allocation = self
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate(&AllocationCreateDesc {
+                name: "",
+                requirements: mem_requirements,
+                location: memory_location,
+                linear: is_linear,
+                allocation_scheme: AllocationScheme::DedicatedImage(image),
+            })
+            .expect("failed to allocate image!");
+
+        unsafe {
+            self.device
+                .handle
+                .bind_image_memory(image, image_allocation.memory(), 0)
+        }
+        .expect("failed to bind image memory!");
+
+        (image, image_allocation)
+    }
+
+    pub fn create_image_view(
+        &self,
+        image: vk::Image,
+        format: vk::Format,
+        aspect_mask: vk::ImageAspectFlags,
+        mip_levels: u32,
+    ) -> vk::ImageView {
+        let component_mapping = vk::ComponentMapping::default();
+        let subresource_range = vk::ImageSubresourceRange::default()
+            .aspect_mask(aspect_mask)
+            .base_mip_level(0)
+            .level_count(mip_levels)
+            .base_array_layer(0)
+            .layer_count(1);
+
+        let image_view_create_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .components(component_mapping)
+            .subresource_range(subresource_range);
+
+        let image_view = unsafe {
+            self.device
+                .handle
+                .create_image_view(&image_view_create_info, None)
+        }
+        .expect("failed to create image view!");
+        image_view
+    }
+}
+
+pub fn find_memory_type(
+    instance: &ash::Instance,
+    physical_device: &vk::PhysicalDevice,
+    type_filter: u32,
+    properties: vk::MemoryPropertyFlags,
+) -> u32 {
+    let mem_properties =
+        unsafe { instance.get_physical_device_memory_properties(*physical_device) };
+    for i in 0..(mem_properties.memory_type_count as usize) {
+        if (type_filter & (1 << i)) != 0
+            && (mem_properties.memory_types[i].property_flags & properties) == properties
+        {
+            return i as u32;
+        }
+    }
+
+    panic!("failed to find suitable memory type!");
 }
 
 pub struct VulkanEngine {
     frame_number: usize,
+    draw_image: AllocatedImage,
     frames: Vec<Arc<FrameData>>,
     pub swapchain: MySwapchain,
     base: BaseVulkanState,
@@ -256,28 +375,54 @@ pub struct VulkanEngine {
 
 impl VulkanEngine {
     pub fn new(window: Window, application_title: String) -> Self {
-        let base_vulkan_state = BaseVulkanState::new(window, application_title);
+        let mut base = BaseVulkanState::new(window, application_title);
 
-        /* let mut allocator = Allocator::new(&AllocatorCreateDesc {
-            instance,
-            device,
-            physical_device,
-            debug_settings: Default::default(),
-            buffer_device_address: true,  // Ideally, check the BufferDeviceAddressFeatures struct.
-            allocation_sizes: Default::default(),
-        }); */
-
-        let window_size = base_vulkan_state.window.inner_size();
+        let window_size = base.window.inner_size();
         let window_height = window_size.height;
         let window_width = window_size.width;
 
-        let swapchain = base_vulkan_state.create_swapchain(window_width, window_height);
+        let swapchain = base.create_swapchain(window_width, window_height);
+
+        let draw_image_extent = vk::Extent2D {
+            width: window_width,
+            height: window_height,
+        };
+        let draw_image_format = vk::Format::R16G16B16A16_SFLOAT;
+        let (draw_image, draw_image_allocation) = base.create_image(
+            draw_image_extent,
+            draw_image_format,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST
+                | vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            gpu_allocator::MemoryLocation::GpuOnly,
+            1,
+            vk::SampleCountFlags::TYPE_1,
+        );
+
+        let draw_image_view = base.create_image_view(
+            draw_image,
+            draw_image_format,
+            vk::ImageAspectFlags::COLOR,
+            1,
+        );
+
+        let draw_image_allocated = AllocatedImage {
+            image: draw_image,
+            image_view: draw_image_view,
+            extent: draw_image_extent.into(),
+            format: draw_image_format,
+            allocation: ManuallyDrop::new(draw_image_allocation),
+            device: base.device.clone(),
+            allocator: base.allocator.clone(),
+        };
 
         Self {
-            base: base_vulkan_state,
+            base,
             frames: vec![],
             frame_number: 0,
-
+            draw_image: draw_image_allocated,
             swapchain,
         }
     }
@@ -389,54 +534,48 @@ impl VulkanEngine {
         let swapchain_image = self.swapchain.swapchain_images[swapchain_image_index as usize];
         self.base.transition_image_layout(
             cmd,
-            swapchain_image,
+            self.draw_image.image,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::GENERAL,
         );
 
-        let clear_value = vk::ClearColorValue {
-            float32: [0., 0., (self.frame_number as f32 / 120.).sin().abs(), 1.],
-        };
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_mip_level(0)
-            .level_count(vk::REMAINING_MIP_LEVELS)
-            .base_array_layer(0)
-            .layer_count(vk::REMAINING_ARRAY_LAYERS);
-        let ranges = [range];
-        unsafe {
-            self.base.device.handle.cmd_clear_color_image(
-                cmd,
-                swapchain_image,
-                vk::ImageLayout::GENERAL,
-                &clear_value,
-                &ranges,
-            )
-        };
+        self.draw_background(cmd);
+
+        self.base.transition_image_layout(
+            cmd,
+            self.draw_image.image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        self.base.transition_image_layout(
+            cmd,
+            swapchain_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+
+        copy_image_to_image(
+            self.base.device.clone(),
+            cmd,
+            self.draw_image.image,
+            swapchain_image,
+            self.draw_image.extent,
+            self.swapchain.extent,
+        );
 
         self.base.transition_image_layout(
             cmd,
             swapchain_image,
-            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
 
         unsafe { self.base.device.handle.end_command_buffer(cmd) }
             .expect("failed to end command buffer!");
 
-        //let command_info = Self::command_buffer_submit_info(cmd);
         let command_info = vk::CommandBufferSubmitInfo::default()
             .command_buffer(current_frame.command_buffer)
             .device_mask(0);
-        /*         let wait_info = Self::semaphore_submit_info(
-            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT_KHR,
-            current_frame.swapchain_semaphore,
-        );
-        let signal_info = Self::semaphore_submit_info(
-            vk::PipelineStageFlags2::ALL_GRAPHICS,
-            current_frame.render_semaphore,
-        );
-         */
         let wait_info = vk::SemaphoreSubmitInfo::default()
             .semaphore(current_frame.swapchain_semaphore)
             .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT_KHR)
@@ -456,7 +595,6 @@ impl VulkanEngine {
             .wait_semaphore_infos(&wait_semaphore_infos)
             .signal_semaphore_infos(&signal_semaphore_infos)
             .command_buffer_infos(&command_buffer_infos);
-        //let submit = Self::submit_info(&command_buffer_infos, &signal_infos, &wait_infos);
         let submits = [submit];
         unsafe {
             self.base.device.handle.queue_submit2(
@@ -511,6 +649,28 @@ impl VulkanEngine {
             .wait_semaphore_infos(wait_semaphore_infos)
             .signal_semaphore_infos(signal_semaphore_infos)
             .command_buffer_infos(command_buffer_infos)
+    }
+
+    pub fn draw_background(&self, cmd: vk::CommandBuffer) {
+        let clear_value = vk::ClearColorValue {
+            float32: [0., 0., (self.frame_number as f32 / 120.).sin().abs(), 1.],
+        };
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_mip_level(0)
+            .level_count(vk::REMAINING_MIP_LEVELS)
+            .base_array_layer(0)
+            .layer_count(vk::REMAINING_ARRAY_LAYERS);
+        let ranges = [range];
+        unsafe {
+            self.base.device.handle.cmd_clear_color_image(
+                cmd,
+                self.draw_image.image,
+                vk::ImageLayout::GENERAL,
+                &clear_value,
+                &ranges,
+            )
+        };
     }
 }
 
@@ -567,4 +727,81 @@ impl Drop for FrameData {
                 .destroy_semaphore(self.swapchain_semaphore, None);
         };
     }
+}
+
+pub struct AllocatedImage {
+    device: Arc<LogicalDevice>,
+    allocator: Arc<Mutex<Allocator>>,
+    image: vk::Image,
+    image_view: vk::ImageView,
+    allocation: ManuallyDrop<Allocation>,
+    extent: vk::Extent2D,
+    format: vk::Format,
+}
+
+impl Drop for AllocatedImage {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.handle.destroy_image_view(self.image_view, None);
+            self.device.handle.destroy_image(self.image, None);
+        }
+        let allocation = unsafe { ManuallyDrop::take(&mut self.allocation) };
+        self.allocator
+            .lock()
+            .unwrap()
+            .free(allocation)
+            .expect("failed to free memory for allocated image!");
+    }
+}
+
+pub fn copy_image_to_image(
+    device: Arc<LogicalDevice>,
+    cmd: vk::CommandBuffer,
+    src: vk::Image,
+    dst: vk::Image,
+    src_size: vk::Extent2D,
+    dst_size: vk::Extent2D,
+) {
+    let blit_region = vk::ImageBlit2::default()
+        .src_offsets([
+            vk::Offset3D::default(),
+            vk::Offset3D {
+                x: src_size.width as i32,
+                y: src_size.height as i32,
+                z: 1,
+            },
+        ])
+        .dst_offsets([
+            vk::Offset3D::default(),
+            vk::Offset3D {
+                x: dst_size.width as i32,
+                y: dst_size.height as i32,
+                z: 1,
+            },
+        ])
+        .src_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0)
+                .layer_count(1)
+                .mip_level(0),
+        )
+        .dst_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_array_layer(0)
+                .layer_count(1)
+                .mip_level(0),
+        );
+
+    let regions = [blit_region];
+    let blit_info = vk::BlitImageInfo2::default()
+        .dst_image(dst)
+        .dst_image_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_image(src)
+        .src_image_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .filter(vk::Filter::LINEAR)
+        .regions(&regions);
+
+    unsafe { device.handle.cmd_blit_image2(cmd, &blit_info) };
 }

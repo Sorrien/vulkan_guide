@@ -30,10 +30,6 @@ impl MySwapchain {
             queue_family_indices,
         )
     }
-
-    //fn new() -> Self {
-
-    //}
 }
 
 impl Drop for MySwapchain {
@@ -116,10 +112,8 @@ impl SwapchainBuilder {
         let (swapchain, swapchain_loader, format, extent) = self
             .create_swapchain(self.window_width, self.window_height)
             .expect("failed to create swapchain!");
-
-        let swapchain_images = Self::create_swapchain_images(swapchain, swapchain_loader.clone())
+        let swapchain_images = Self::create_swapchain_images(&swapchain, &swapchain_loader)
             .expect("failed to get swapchain images!");
-
         let swapchain_image_views = self.create_swapchain_image_views(&swapchain_images, format);
 
         MySwapchain {
@@ -173,7 +167,7 @@ impl SwapchainBuilder {
             (vk::SharingMode::EXCLUSIVE, vec![])
         };
 
-        let swapchain_loader = Swapchain::new(&self.instance.handle, &self.device.handle);
+        let swapchain_loader = Swapchain::new(&self.instance.handle, & self.device.handle);
         let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface.handle)
             .min_image_count(image_count)
@@ -246,10 +240,10 @@ impl SwapchainBuilder {
     }
 
     fn create_swapchain_images(
-        swapchain: vk::SwapchainKHR,
-        swapchain_loader: Swapchain,
+        swapchain: &vk::SwapchainKHR,
+        swapchain_loader: &Swapchain,
     ) -> Result<Vec<vk::Image>, vk::Result> {
-        unsafe { swapchain_loader.get_swapchain_images(swapchain) }
+        unsafe { swapchain_loader.get_swapchain_images(*swapchain) }
     }
 
     fn create_swapchain_image_views(

@@ -217,27 +217,13 @@ impl InstanceBuilder {
                 &debug_info as *const vk::DebugUtilsMessengerCreateInfoEXT as *const c_void;
         }
 
-        let mut create_info = vk::InstanceCreateInfo::default()
-            .application_info(&appinfo)
-            .enabled_extension_names(&required_extension_names);
-
-        let debug_info = debug::create_debug_info();
-        if self.enable_validation_layers {
-            Self::check_validation_layer_support(entry, &layers_names_raw);
-            create_info = create_info.enabled_layer_names(&layers_names_raw);
-
-            create_info.p_next =
-                &debug_info as *const vk::DebugUtilsMessengerCreateInfoEXT as *const c_void;
-        }
-
         let instance_handle = unsafe {
             entry
                 .create_instance(&create_info, None)
                 .expect("Instance creation error!")
         };
 
-        let instance = Instance::new(instance_handle);
-        instance
+        Instance::new(instance_handle)
     }
 
     fn check_validation_layer_support(entry: &ash::Entry, layers_names_raw: &Vec<*const c_char>) {
