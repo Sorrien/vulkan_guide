@@ -1,18 +1,17 @@
 use std::{
-    ffi::CString,
+    ffi::CStr,
     mem::ManuallyDrop,
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
-use ash::{extensions::khr::Swapchain, vk, Entry};
-use ash_bootstrap::{
-    Instance, InstanceBuilder, LogicalDevice, PhysicalDeviceSelector, QueueFamilyIndices,
-    VulkanSurface,
-};
-use debug::DebugMessenger;
+use ash::vk;
+use ash_bootstrap::LogicalDevice;
+use base_vulkan::{BaseVulkanState, FrameData, Pipeline};
+use descriptors::{Descriptor, DescriptorAllocator, PoolSizeRatio};
 use gpu_allocator::vulkan::*;
-use raw_window_handle::{HasRawDisplayHandle, HasRawWindowHandle};
-use swapchain::{MySwapchain, SwapchainBuilder, SwapchainSupportDetails};
+use imgui_rs_vulkan_renderer::DynamicRendering;
+use swapchain::MySwapchain;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::EventLoop,
@@ -20,353 +19,20 @@ use winit::{
 };
 
 pub mod ash_bootstrap;
+pub mod base_vulkan;
 pub mod debug;
+pub mod descriptors;
 pub mod swapchain;
 
 const FRAME_OVERLAP: usize = 2;
 
-pub struct BaseVulkanState {
-    pub msaa_samples: vk::SampleCountFlags,
-    pub queue_family_indices: QueueFamilyIndices,
-    pub swapchain_support: SwapchainSupportDetails,
-    pub allocator: Arc<Mutex<Allocator>>,
-    pub graphics_queue: vk::Queue,
-    pub device: Arc<LogicalDevice>,
-    pub physical_device: vk::PhysicalDevice,
-    pub debug_messenger: DebugMessenger,
-    pub surface: Arc<VulkanSurface>,
-    pub instance: Arc<Instance>,
-    pub entry: Entry,
-    pub window: Window,
-}
-
-impl BaseVulkanState {
-    pub fn new(window: Window, application_title: String) -> Self {
-        #[cfg(feature = "validation_layers")]
-        let enable_validation_layers = true;
-        #[cfg(not(feature = "validation_layers"))]
-        let enable_validation_layers = false;
-
-        let entry = unsafe { ash::Entry::load() }.expect("vulkan entry failed to load!");
-        let instance = InstanceBuilder::new()
-            .entry(entry.clone())
-            .application_name(application_title)
-            .api_version(vk::API_VERSION_1_3)
-            .raw_display_handle(window.raw_display_handle())
-            .enable_validation_layers(enable_validation_layers)
-            .build();
-
-        let debug_messenger =
-            DebugMessenger::new(&entry, instance.clone(), enable_validation_layers);
-
-        let surface = VulkanSurface::new(
-            &entry,
-            instance.clone(),
-            window.raw_display_handle(),
-            window.raw_window_handle(),
-        )
-        .expect("failed to create window surface!");
-
-        // Application can't function without geometry shaders or the graphics queue family or anisotropy (we could remove anisotropy)
-        let device_features = vk::PhysicalDeviceFeatures::default()
-            .geometry_shader(true)
-            .sampler_anisotropy(true);
-        let features13 = vk::PhysicalDeviceVulkan13Features::default()
-            .dynamic_rendering(true)
-            .synchronization2(true);
-        let features12 = vk::PhysicalDeviceVulkan12Features::default()
-            .buffer_device_address(true)
-            .descriptor_indexing(true);
-
-        let selector = PhysicalDeviceSelector::new(instance.clone(), surface.clone());
-
-        let required_extensions = vec![CString::from(Swapchain::NAME)];
-        let bootstrap_physical_device = selector
-            .set_required_extensions(required_extensions.clone())
-            .set_required_features(device_features)
-            .set_required_features_12(features12)
-            .set_required_features_13(features13)
-            .select()
-            .expect("failed to select physical device!");
-
-        let device = LogicalDevice::new(
-            instance.clone(),
-            bootstrap_physical_device.physical_device,
-            &bootstrap_physical_device.queue_family_indices,
-            required_extensions,
-            device_features,
-            features12,
-            features13,
-        )
-        .expect("failed to create logical device!");
-
-        let graphics_queue = unsafe {
-            device.handle.get_device_queue(
-                bootstrap_physical_device
-                    .queue_family_indices
-                    .graphics_family
-                    .unwrap() as u32,
-                0,
-            )
-        };
-        let allocator = Allocator::new(&AllocatorCreateDesc {
-            instance: instance.handle.clone(),
-            device: device.handle.clone(),
-            physical_device: bootstrap_physical_device.physical_device.clone(),
-            debug_settings: Default::default(),
-            buffer_device_address: true, // Ideally, check the BufferDeviceAddressFeatures struct.
-            allocation_sizes: Default::default(),
-        })
-        .expect("failed to create allocator!");
-
-        Self {
-            entry,
-            window,
-            instance,
-            physical_device: bootstrap_physical_device.physical_device,
-            device,
-            queue_family_indices: bootstrap_physical_device.queue_family_indices,
-            graphics_queue,
-            surface,
-            swapchain_support: bootstrap_physical_device.swapchain_support_details,
-            debug_messenger,
-            msaa_samples: bootstrap_physical_device.max_sample_count,
-            allocator: Arc::new(Mutex::new(allocator)),
-        }
-    }
-
-    pub fn create_swapchain(&self, window_width: u32, window_height: u32) -> MySwapchain {
-        let bootstrap_swapchain = SwapchainBuilder::new(
-            self.instance.clone(),
-            self.device.clone(),
-            self.surface.clone(),
-            self.swapchain_support.clone(),
-            self.queue_family_indices,
-        )
-        .desired_extent(window_width, window_height)
-        .desired_present_mode(vk::PresentModeKHR::FIFO)
-        .desired_surface_format(
-            vk::SurfaceFormatKHR::default()
-                .format(vk::Format::B8G8R8A8_UNORM)
-                .color_space(vk::ColorSpaceKHR::SRGB_NONLINEAR),
-        )
-        .add_image_usage_flags(vk::ImageUsageFlags::TRANSFER_DST)
-        .build();
-        bootstrap_swapchain
-    }
-
-    pub fn create_command_pool(
-        &self,
-        flags: vk::CommandPoolCreateFlags,
-    ) -> Result<vk::CommandPool, vk::Result> {
-        let pool_info = vk::CommandPoolCreateInfo::default()
-            .flags(flags)
-            .queue_family_index(self.queue_family_indices.graphics_family.unwrap() as u32);
-
-        unsafe { self.device.handle.create_command_pool(&pool_info, None) }
-    }
-
-    pub fn create_command_buffers(
-        &self,
-        command_pool: vk::CommandPool,
-        count: u32,
-    ) -> Result<Vec<vk::CommandBuffer>, vk::Result> {
-        let alloc_info = vk::CommandBufferAllocateInfo::default()
-            .command_pool(command_pool)
-            .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(count);
-
-        unsafe { self.device.handle.allocate_command_buffers(&alloc_info) }
-    }
-
-    pub fn create_frame_data(&self, count: usize) -> Vec<Arc<FrameData>> {
-        (0..count)
-            .map(|_| {
-                let command_pool = self
-                    .create_command_pool(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
-                    .expect("failed to create command pool!");
-                let command_buffer = self
-                    .create_command_buffers(command_pool, 1)
-                    .expect("failed to create command buffer!")[0];
-
-                let render_fence = self
-                    .create_fence(vk::FenceCreateFlags::SIGNALED)
-                    .expect("failed to create render fence!");
-                let swapchain_semaphore = self
-                    .create_semaphore(vk::SemaphoreCreateFlags::empty())
-                    .expect("failed to create swapchain semaphore!");
-                let render_semaphore = self
-                    .create_semaphore(vk::SemaphoreCreateFlags::empty())
-                    .expect("failed to create swapchain semaphore!");
-                FrameData::new(
-                    self.device.clone(),
-                    command_pool,
-                    command_buffer,
-                    render_fence,
-                    swapchain_semaphore,
-                    render_semaphore,
-                )
-            })
-            .collect::<Vec<_>>()
-    }
-
-    pub fn create_fence(&self, flags: vk::FenceCreateFlags) -> Result<vk::Fence, vk::Result> {
-        let fence_create_info = vk::FenceCreateInfo::default().flags(flags);
-        unsafe { self.device.handle.create_fence(&fence_create_info, None) }
-    }
-
-    pub fn create_semaphore(
-        &self,
-        flags: vk::SemaphoreCreateFlags,
-    ) -> Result<vk::Semaphore, vk::Result> {
-        let create_info = vk::SemaphoreCreateInfo::default().flags(flags);
-        unsafe { self.device.handle.create_semaphore(&create_info, None) }
-    }
-
-    pub fn transition_image_layout(
-        &self,
-        command_buffer: vk::CommandBuffer,
-        image: vk::Image,
-        old_layout: vk::ImageLayout,
-        new_layout: vk::ImageLayout,
-    ) {
-        let aspect_mask = if new_layout == vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL {
-            vk::ImageAspectFlags::DEPTH
-        } else {
-            vk::ImageAspectFlags::COLOR
-        };
-
-        let barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-            .dst_access_mask(vk::AccessFlags2::MEMORY_WRITE | vk::AccessFlags2::MEMORY_WRITE)
-            .old_layout(old_layout)
-            .new_layout(new_layout)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(aspect_mask)
-                    .base_mip_level(0)
-                    .level_count(vk::REMAINING_MIP_LEVELS)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            )
-            .image(image);
-
-        let barriers = [barrier];
-        let dependency_info = vk::DependencyInfo::default().image_memory_barriers(&barriers);
-
-        unsafe {
-            self.device
-                .handle
-                .cmd_pipeline_barrier2(command_buffer, &dependency_info)
-        };
-    }
-
-    pub fn create_image(
-        &mut self,
-        img_extent: vk::Extent2D,
-        format: vk::Format,
-        tiling: vk::ImageTiling,
-        usage: vk::ImageUsageFlags,
-        memory_location: gpu_allocator::MemoryLocation,
-        mip_levels: u32,
-        num_samples: vk::SampleCountFlags,
-    ) -> (vk::Image, Allocation) {
-        let image_info = vk::ImageCreateInfo::default()
-            .image_type(vk::ImageType::TYPE_2D)
-            .extent(img_extent.into())
-            .mip_levels(mip_levels)
-            .array_layers(1)
-            .format(format)
-            .tiling(tiling)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .samples(num_samples);
-
-        let image = unsafe { self.device.handle.create_image(&image_info, None) }
-            .expect("failed to create image!");
-
-        let mem_requirements = unsafe { self.device.handle.get_image_memory_requirements(image) };
-
-        let is_linear = tiling == vk::ImageTiling::LINEAR;
-        let image_allocation = self
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate(&AllocationCreateDesc {
-                name: "",
-                requirements: mem_requirements,
-                location: memory_location,
-                linear: is_linear,
-                allocation_scheme: AllocationScheme::DedicatedImage(image),
-            })
-            .expect("failed to allocate image!");
-
-        unsafe {
-            self.device
-                .handle
-                .bind_image_memory(image, image_allocation.memory(), 0)
-        }
-        .expect("failed to bind image memory!");
-
-        (image, image_allocation)
-    }
-
-    pub fn create_image_view(
-        &self,
-        image: vk::Image,
-        format: vk::Format,
-        aspect_mask: vk::ImageAspectFlags,
-        mip_levels: u32,
-    ) -> vk::ImageView {
-        let component_mapping = vk::ComponentMapping::default();
-        let subresource_range = vk::ImageSubresourceRange::default()
-            .aspect_mask(aspect_mask)
-            .base_mip_level(0)
-            .level_count(mip_levels)
-            .base_array_layer(0)
-            .layer_count(1);
-
-        let image_view_create_info = vk::ImageViewCreateInfo::default()
-            .image(image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(format)
-            .components(component_mapping)
-            .subresource_range(subresource_range);
-
-        let image_view = unsafe {
-            self.device
-                .handle
-                .create_image_view(&image_view_create_info, None)
-        }
-        .expect("failed to create image view!");
-        image_view
-    }
-}
-
-pub fn find_memory_type(
-    instance: &ash::Instance,
-    physical_device: &vk::PhysicalDevice,
-    type_filter: u32,
-    properties: vk::MemoryPropertyFlags,
-) -> u32 {
-    let mem_properties =
-        unsafe { instance.get_physical_device_memory_properties(*physical_device) };
-    for i in 0..(mem_properties.memory_type_count as usize) {
-        if (type_filter & (1 << i)) != 0
-            && (mem_properties.memory_types[i].property_flags & properties) == properties
-        {
-            return i as u32;
-        }
-    }
-
-    panic!("failed to find suitable memory type!");
-}
-
 pub struct VulkanEngine {
     frame_number: usize,
+    //imgui_context: ImguiContext,
+    immediate_command: base_vulkan::ImmediateCommand,
+    gradient_pipeline: Pipeline,
+    draw_image_descriptor: Descriptor,
+    global_descriptor_allocator: descriptors::DescriptorAllocator,
     draw_image: AllocatedImage,
     frames: Vec<Arc<FrameData>>,
     pub swapchain: MySwapchain,
@@ -418,13 +84,64 @@ impl VulkanEngine {
             allocator: base.allocator.clone(),
         };
 
+        let mut global_descriptor_allocator = DescriptorAllocator::new(base.device.clone());
+
+        let draw_image_descriptor =
+            base.init_descriptors(&mut global_descriptor_allocator, &draw_image_allocated);
+
+        let gradient_pipeline = base.init_pipelines(draw_image_descriptor.layout);
+
+        let immediate_command = base.init_immediate_command();
+
+        /*         let imgui_context = ImguiContext::new(
+            &base.window,
+            &base.allocator,
+            &base.device,
+            base.graphics_queue,
+            immediate_command.command_pool,
+            swapchain.format,
+        ); */
+
         Self {
             base,
             frames: vec![],
             frame_number: 0,
             draw_image: draw_image_allocated,
             swapchain,
+            global_descriptor_allocator,
+            draw_image_descriptor,
+            gradient_pipeline,
+            immediate_command,
+            //imgui_context,
         }
+    }
+
+    /* pub fn init_imgui(&self) -> ImguiContext {
+        ImguiContext::new(
+            &self.base.window,
+            &self.base.allocator,
+            &self.base.device,
+            self.base.graphics_queue,
+            self.immediate_command.command_pool,
+            self.swapchain.format,
+        )
+    } */
+
+    pub fn init_imgui(
+        &self,
+    ) -> (
+        imgui::Context,
+        imgui_winit_support::WinitPlatform,
+        imgui_rs_vulkan_renderer::Renderer,
+    ) {
+        init_imgui(
+            &self.base.window,
+            &self.base.allocator,
+            &self.base.device,
+            self.base.graphics_queue,
+            self.immediate_command.command_pool,
+            self.swapchain.format,
+        )
     }
 
     pub fn init_commands(&mut self) {
@@ -450,45 +167,110 @@ impl VulkanEngine {
         self.frames[self.frame_number % FRAME_OVERLAP].clone()
     }
 
-    pub fn run(&mut self, event_loop: EventLoop<()>) -> Result<(), winit::error::EventLoopError> {
-        self.main_loop(event_loop)
+    pub fn run(
+        &mut self,
+        event_loop: EventLoop<()>,
+        imgui: imgui::Context,
+        platform: imgui_winit_support::WinitPlatform,
+        imgui_renderer: imgui_rs_vulkan_renderer::Renderer,
+    ) -> Result<(), winit::error::EventLoopError> {
+        self.main_loop(event_loop, imgui, platform, imgui_renderer)
     }
 
-    fn main_loop(&mut self, event_loop: EventLoop<()>) -> Result<(), winit::error::EventLoopError> {
-        event_loop.run(move |event, elwt| match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                unsafe { self.base.device.handle.device_wait_idle() }
-                    .expect("failed to wait for idle on exit!");
-                elwt.exit()
-            }
-            Event::AboutToWait => {
-                //AboutToWait is the new MainEventsCleared
-                self.base.window.request_redraw();
-            }
-            Event::WindowEvent {
-                event: WindowEvent::RedrawRequested,
-                window_id: _,
-            } => {
-                let size = self.base.window.inner_size();
-                //don't attempt to draw a frame in window size is 0zs
-                if size.height > 0 && size.width > 0 {
-                    self.draw();
+    fn main_loop(
+        &mut self,
+        event_loop: EventLoop<()>,
+        mut imgui: imgui::Context,
+        mut platform: imgui_winit_support::WinitPlatform,
+        mut imgui_renderer: imgui_rs_vulkan_renderer::Renderer,
+    ) -> Result<(), winit::error::EventLoopError> {
+        let mut last_frame = Instant::now();
+        let mut stop_rendering = false;
+
+        let mut value = 0;
+        let choices = ["test test this is 1", "test test this is 2"];
+
+        event_loop.run(move |event, elwt| {
+            platform.handle_event(imgui.io_mut(), &self.base.window, &event);
+
+            match event {
+                Event::NewEvents(_) => {
+                    let now = Instant::now();
+
+                    imgui.io_mut().update_delta_time(now - last_frame);
+                    last_frame = now;
                 }
+                Event::WindowEvent {
+                    event: WindowEvent::CloseRequested,
+                    ..
+                } => {
+                    unsafe { self.base.device.handle.device_wait_idle() }
+                        .expect("failed to wait for idle on exit!");
+                    elwt.exit()
+                }
+                Event::AboutToWait => {
+                    //AboutToWait is the new MainEventsCleared
+                    self.base.window.request_redraw();
+                }
+                Event::WindowEvent {
+                    event: WindowEvent::RedrawRequested,
+                    window_id: _,
+                } => {
+                    let size = self.base.window.inner_size();
+                    platform
+                        .prepare_frame(imgui.io_mut(), &self.base.window)
+                        .expect("failed to prepare frame!");
+                    let ui = imgui.frame();
+
+                    ui.window("Hello world")
+                        .size([300.0, 110.0], imgui::Condition::FirstUseEver)
+                        .build(|| {
+                            ui.text_wrapped("Hello world!");
+                            ui.text_wrapped("こんにちは世界！");
+                            if ui.button(choices[value]) {
+                                value += 1;
+                                value %= 2;
+                            }
+
+                            ui.button("This...is...imgui-rs!");
+                            ui.separator();
+                            let mouse_pos = ui.io().mouse_pos;
+                            ui.text(format!(
+                                "Mouse Position: ({:.1},{:.1})",
+                                mouse_pos[0], mouse_pos[1]
+                            ));
+                        });
+                    //ui_builder
+                    platform.prepare_render(ui, &self.base.window);
+                    let draw_data = imgui.render();
+
+                    //don't attempt to draw a frame in window size is 0
+                    if size.height > 0 && size.width > 0 && !stop_rendering {
+                        self.draw(draw_data, &mut imgui_renderer);
+                    }
+                }
+                Event::WindowEvent {
+                    window_id: _,
+                    event: WindowEvent::Focused(is_focused),
+                } => {
+                    //stop_rendering = !is_focused;
+                }
+                Event::WindowEvent {
+                    window_id: _,
+                    event: WindowEvent::Resized(_new_size),
+                } => {
+                    //self.framebuffer_resized = true;
+                }
+                _ => (),
             }
-            Event::WindowEvent {
-                window_id: _,
-                event: WindowEvent::Resized(_new_size),
-            } => {
-                //self.framebuffer_resized = true;
-            }
-            _ => (),
         })
     }
 
-    pub fn draw(&mut self) {
+    pub fn draw(
+        &mut self,
+        draw_data: &imgui::DrawData,
+        imgui_renderer: &mut imgui_rs_vulkan_renderer::Renderer,
+    ) {
         let current_frame = self.get_current_frame();
         let fences = [current_frame.render_fence];
         unsafe {
@@ -567,6 +349,20 @@ impl VulkanEngine {
             cmd,
             swapchain_image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+
+        self.draw_imgui(
+            cmd,
+            draw_data,
+            imgui_renderer,
+            self.swapchain.swapchain_image_views[swapchain_image_index as usize],
+        );
+
+        self.base.transition_image_layout(
+            cmd,
+            swapchain_image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
 
@@ -652,26 +448,218 @@ impl VulkanEngine {
     }
 
     pub fn draw_background(&self, cmd: vk::CommandBuffer) {
-        let clear_value = vk::ClearColorValue {
-            float32: [0., 0., (self.frame_number as f32 / 120.).sin().abs(), 1.],
-        };
-        let range = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_mip_level(0)
-            .level_count(vk::REMAINING_MIP_LEVELS)
-            .base_array_layer(0)
-            .layer_count(vk::REMAINING_ARRAY_LAYERS);
-        let ranges = [range];
         unsafe {
-            self.base.device.handle.cmd_clear_color_image(
+            self.base.device.handle.cmd_bind_pipeline(
                 cmd,
-                self.draw_image.image,
-                vk::ImageLayout::GENERAL,
-                &clear_value,
-                &ranges,
+                vk::PipelineBindPoint::COMPUTE,
+                self.gradient_pipeline.pipeline,
+            )
+        }
+        let descriptor_sets = [self.draw_image_descriptor.set];
+        let dynamic_offsets = [];
+        unsafe {
+            self.base.device.handle.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.gradient_pipeline.pipeline_layout,
+                0,
+                &descriptor_sets,
+                &dynamic_offsets,
             )
         };
+
+        unsafe {
+            self.base.device.handle.cmd_dispatch(
+                cmd,
+                (self.draw_image.extent.width as f32 / 16.).ceil() as u32,
+                (self.draw_image.extent.height as f32 / 16.).ceil() as u32,
+                1,
+            );
+        }
     }
+
+    pub fn draw_imgui(
+        &mut self,
+        cmd: vk::CommandBuffer,
+        draw_data: &imgui::DrawData,
+        imgui_renderer: &mut imgui_rs_vulkan_renderer::Renderer,
+        target_image_view: vk::ImageView,
+    ) {
+        let color_attachment =
+            Self::attachment_info(target_image_view, None, vk::ImageLayout::GENERAL);
+        let color_attachments = [color_attachment];
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(self.swapchain.extent.into())
+            .color_attachments(&color_attachments)
+            .flags(vk::RenderingFlags::CONTENTS_INLINE_EXT).layer_count(1); //todo fill this out
+
+        unsafe {
+            self.base
+                .device
+                .handle
+                .cmd_begin_rendering(cmd, &rendering_info)
+        };
+
+        imgui_renderer
+            .cmd_draw(cmd, draw_data)
+            .expect("failed to draw imgui data!");
+
+        unsafe { self.base.device.handle.cmd_end_rendering(cmd) };
+    }
+
+    fn attachment_info(
+        view: vk::ImageView,
+        clear: Option<vk::ClearValue>,
+        layout: vk::ImageLayout,
+    ) -> vk::RenderingAttachmentInfo<'static> {
+        let load_op = if clear.is_some() {
+            vk::AttachmentLoadOp::CLEAR
+        } else {
+            vk::AttachmentLoadOp::LOAD
+        };
+        let mut result = vk::RenderingAttachmentInfo::default()
+            .image_view(view)
+            .image_layout(layout)
+            .load_op(load_op)
+            .store_op(vk::AttachmentStoreOp::STORE);
+
+        if let Some(clear) = clear {
+            result = result.clear_value(clear);
+        }
+
+        result
+    }
+
+    pub fn immediate_submit<F: FnOnce(vk::CommandBuffer)>(&self, f: F) {
+        let fences = [self.immediate_command.fence];
+        unsafe { self.base.device.handle.reset_fences(&fences) }
+            .expect("failed to reset immediate submit fence!");
+        unsafe {
+            self.base.device.handle.reset_command_buffer(
+                self.immediate_command.command_buffer,
+                vk::CommandBufferResetFlags::empty(),
+            )
+        }
+        .expect("failed to reset imm submit cmd buffer!");
+
+        let cmd = self.immediate_command.command_buffer;
+        let device = &self.base.device.handle;
+
+        f(cmd);
+
+        unsafe { device.end_command_buffer(cmd) }.expect("failed to end imm submit cmd buffer!");
+
+        let cmd_info = Self::command_buffer_submit_info(cmd);
+        let cmd_infos = [cmd_info];
+        let submit = Self::submit_info(&cmd_infos, &[], &[]);
+
+        //we may want to find a different queue than graphics for this if possible
+        let submits = [submit];
+        unsafe {
+            device.queue_submit2(
+                self.base.graphics_queue,
+                &submits,
+                self.immediate_command.fence,
+            )
+        }
+        .expect("failed to submit imm cmd!");
+
+        let fences = [self.immediate_command.fence];
+        unsafe { device.wait_for_fences(&fences, true, u64::MAX) }
+            .expect("failed to wait for imm submit fence!");
+    }
+
+    /*     pub fn init_imgui(&self) {
+        /*         let pool_sizes = [
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                descriptor_count: 1000,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::INPUT_ATTACHMENT,
+                descriptor_count: 1000,
+            },
+        ];
+
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+            .max_sets(1000)
+            .pool_sizes(&pool_sizes);
+
+        let imgui_pool = unsafe {
+            self.base
+                .device
+                .handle
+                .create_descriptor_pool(&pool_info, None)
+        }
+        .expect("failed to create imgui descriptor pool!"); */
+
+        let mut imgui_context = imgui::Context::create();
+
+        imgui_context.set_ini_filename(None);
+
+        let mut winit_platform = imgui_winit_support::WinitPlatform::init(&mut imgui_context);
+        let dpi_mode = imgui_winit_support::HiDpiMode::Default;
+
+        winit_platform.attach_window(imgui_context.io_mut(), &self.base.window, dpi_mode);
+        imgui_context
+            .fonts()
+            .add_font(&[imgui::FontSource::DefaultFontData { config: None }]);
+
+        //init imgui for vulkan somehow
+        let renderer = imgui_rs_vulkan_renderer::Renderer::with_gpu_allocator(
+            self.base.allocator.clone(),
+            self.base.device.handle.clone(),
+            self.base.graphics_queue,
+            self.immediate_command.command_pool,
+            DynamicRendering {
+                color_attachment_format: self.swapchain.format,
+                depth_attachment_format: None,
+            },
+            &mut imgui_context,
+            Some(imgui_rs_vulkan_renderer::Options {
+                in_flight_frames: FRAME_OVERLAP,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    } */
 }
 
 impl Drop for VulkanEngine {
@@ -681,52 +669,100 @@ impl Drop for VulkanEngine {
     }
 }
 
-#[derive(Clone)]
-pub struct FrameData {
-    device: Arc<LogicalDevice>,
-    command_pool: vk::CommandPool,
-    command_buffer: vk::CommandBuffer,
-    render_fence: vk::Fence,
-    swapchain_semaphore: vk::Semaphore,
-    render_semaphore: vk::Semaphore,
+pub struct ImguiContext {
+    pub renderer: imgui_rs_vulkan_renderer::Renderer,
+    pub platform: imgui_winit_support::WinitPlatform,
+    pub imgui: imgui::Context,
 }
 
-impl FrameData {
+impl ImguiContext {
     pub fn new(
-        device: Arc<LogicalDevice>,
+        window: &Window,
+        allocator: &Arc<Mutex<Allocator>>,
+        device: &Arc<LogicalDevice>,
+        graphics_queue: vk::Queue,
         command_pool: vk::CommandPool,
-        command_buffer: vk::CommandBuffer,
-        render_fence: vk::Fence,
-        swapchain_semaphore: vk::Semaphore,
-        render_semaphore: vk::Semaphore,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            device,
+        format: vk::Format,
+    ) -> Self {
+        let mut imgui = imgui::Context::create();
+
+        imgui.set_ini_filename(None);
+
+        let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
+        let dpi_mode = imgui_winit_support::HiDpiMode::Default;
+
+        platform.attach_window(imgui.io_mut(), window, dpi_mode);
+        imgui
+            .fonts()
+            .add_font(&[imgui::FontSource::DefaultFontData { config: None }]);
+
+        let renderer = imgui_rs_vulkan_renderer::Renderer::with_gpu_allocator(
+            allocator.clone(),
+            device.handle.clone(),
+            graphics_queue,
             command_pool,
-            command_buffer,
-            render_fence,
-            swapchain_semaphore,
-            render_semaphore,
-        })
+            DynamicRendering {
+                color_attachment_format: format,
+                depth_attachment_format: None,
+            },
+            &mut imgui,
+            Some(imgui_rs_vulkan_renderer::Options {
+                in_flight_frames: FRAME_OVERLAP,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        Self {
+            renderer,
+            platform,
+            imgui,
+        }
     }
 }
 
-impl Drop for FrameData {
-    fn drop(&mut self) {
-        unsafe {
-            self.device
-                .handle
-                .destroy_command_pool(self.command_pool, None);
+pub fn init_imgui(
+    window: &Window,
+    allocator: &Arc<Mutex<Allocator>>,
+    device: &Arc<LogicalDevice>,
+    graphics_queue: vk::Queue,
+    command_pool: vk::CommandPool,
+    format: vk::Format,
+) -> (
+    imgui::Context,
+    imgui_winit_support::WinitPlatform,
+    imgui_rs_vulkan_renderer::Renderer,
+) {
+    let mut imgui = imgui::Context::create();
 
-            self.device.handle.destroy_fence(self.render_fence, None);
-            self.device
-                .handle
-                .destroy_semaphore(self.render_semaphore, None);
-            self.device
-                .handle
-                .destroy_semaphore(self.swapchain_semaphore, None);
-        };
-    }
+    imgui.set_ini_filename(None);
+
+    let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
+    let dpi_mode = imgui_winit_support::HiDpiMode::Default;
+
+    platform.attach_window(imgui.io_mut(), window, dpi_mode);
+    imgui
+        .fonts()
+        .add_font(&[imgui::FontSource::DefaultFontData { config: None }]);
+
+    let renderer = imgui_rs_vulkan_renderer::Renderer::with_gpu_allocator(
+        allocator.clone(),
+        device.handle.clone(),
+        graphics_queue,
+        command_pool,
+        DynamicRendering {
+            color_attachment_format: format,
+            depth_attachment_format: None,
+        },
+        &mut imgui,
+        Some(imgui_rs_vulkan_renderer::Options {
+            in_flight_frames: FRAME_OVERLAP,
+            ..Default::default()
+        }),
+    )
+    .unwrap();
+
+    (imgui, platform, renderer)
 }
 
 pub struct AllocatedImage {

@@ -18,7 +18,12 @@ rand = "0.8"
 gpu-allocator = { git = "https://github.com/Sorrien/gpu-allocator", features = [
     "vulkan",
 ] }
-bevy_reflect = "0.12"
+imgui = { git = "https://github.com/imgui-rs/imgui-rs" }
+imgui-winit-support = { git = "https://github.com/imgui-rs/imgui-rs" }
+imgui-rs-vulkan-renderer = { git = "https://github.com/Sorrien/imgui-rs-vulkan-renderer/", features = [
+    "gpu-allocator",
+    "dynamic-rendering",
+] }
 
 [features]
 validation_layers = []

@@ -6,5 +6,7 @@ fn main() -> Result<(), winit::error::EventLoopError> {
 
     let mut vulkan_engine = VulkanEngine::new(window, title);
     vulkan_engine.init_commands();
-    vulkan_engine.run(event_loop)
+    //vulkan_engine.init_descriptors();
+    let (imgui, platform, imgui_renderer) = vulkan_engine.init_imgui();
+    vulkan_engine.run(event_loop, imgui, platform, imgui_renderer)
 }
