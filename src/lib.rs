@@ -1,6 +1,6 @@
 use std::{
     ffi::CStr,
-    mem::ManuallyDrop,
+    mem::{size_of, ManuallyDrop},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -27,10 +27,12 @@ pub mod swapchain;
 const FRAME_OVERLAP: usize = 2;
 
 pub struct VulkanEngine {
+    current_background_effect: usize,
     frame_number: usize,
     //imgui_context: ImguiContext,
     immediate_command: base_vulkan::ImmediateCommand,
-    gradient_pipeline: Pipeline,
+    background_effects: Vec<ComputeEffect>,
+    background_effect_pipeline_layout: Arc<base_vulkan::PipelineLayout>,
     draw_image_descriptor: Descriptor,
     global_descriptor_allocator: descriptors::DescriptorAllocator,
     draw_image: AllocatedImage,
@@ -89,7 +91,8 @@ impl VulkanEngine {
         let draw_image_descriptor =
             base.init_descriptors(&mut global_descriptor_allocator, &draw_image_allocated);
 
-        let gradient_pipeline = base.init_pipelines(draw_image_descriptor.layout);
+        let (background_effects, background_effect_pipeline_layout) =
+            base.init_pipelines(draw_image_descriptor.layout);
 
         let immediate_command = base.init_immediate_command();
 
@@ -110,8 +113,10 @@ impl VulkanEngine {
             swapchain,
             global_descriptor_allocator,
             draw_image_descriptor,
-            gradient_pipeline,
+            background_effects,
+            background_effect_pipeline_layout,
             immediate_command,
+            current_background_effect: 0,
             //imgui_context,
         }
     }
@@ -221,26 +226,22 @@ impl VulkanEngine {
                         .prepare_frame(imgui.io_mut(), &self.base.window)
                         .expect("failed to prepare frame!");
                     let ui = imgui.frame();
-                    ui.show_demo_window(&mut true);
-/*                     ui.window("Hello world")
-                        .size([300.0, 110.0], imgui::Condition::FirstUseEver)
-                        .build(|| {
-                            ui.text_wrapped("Hello world!");
-                            ui.text_wrapped("こんにちは世界！");
-                            if ui.button(choices[value]) {
-                                value += 1;
-                                value %= 2;
-                            }
 
-                            ui.button("This...is...imgui-rs!");
-                            ui.separator();
-                            let mouse_pos = ui.io().mouse_pos;
-                            ui.text(format!(
-                                "Mouse Position: ({:.1},{:.1})",
-                                mouse_pos[0], mouse_pos[1]
-                            ));
-                        }); */
-                    //ui_builder
+                    ui.window("background").build(|| {
+                        ui.text(format!("Selected effect: {}", "test"));
+                        ui.slider(
+                            "Effect Index",
+                            0,
+                            self.background_effects.len() - 1,
+                            &mut self.current_background_effect,
+                        );
+                        let selected = &mut self.background_effects[self.current_background_effect];
+                        ui.input_float4("data1", &mut selected.data.data1).build();
+                        ui.input_float4("data2", &mut selected.data.data2).build();
+                        ui.input_float4("data3", &mut selected.data.data3).build();
+                        ui.input_float4("data4", &mut selected.data.data4).build();
+                    });
+
                     platform.prepare_render(ui, &self.base.window);
                     let draw_data = imgui.render();
 
@@ -448,11 +449,13 @@ impl VulkanEngine {
     }
 
     pub fn draw_background(&self, cmd: vk::CommandBuffer) {
+        let cur_effect = &self.background_effects[self.current_background_effect];
+
         unsafe {
             self.base.device.handle.cmd_bind_pipeline(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                self.gradient_pipeline.pipeline,
+                cur_effect.pipeline.pipeline,
             )
         }
         let descriptor_sets = [self.draw_image_descriptor.set];
@@ -461,10 +464,23 @@ impl VulkanEngine {
             self.base.device.handle.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                self.gradient_pipeline.pipeline_layout,
+                cur_effect.pipeline.pipeline_layout.handle,
                 0,
                 &descriptor_sets,
                 &dynamic_offsets,
+            )
+        };
+
+        let pc = &cur_effect.data;
+
+        unsafe {
+            let push = any_as_u8_slice(pc);
+            self.base.device.handle.cmd_push_constants(
+                cmd,
+                cur_effect.pipeline.pipeline_layout.handle,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push,
             )
         };
 
@@ -749,4 +765,23 @@ pub fn copy_image_to_image(
         .regions(&regions);
 
     unsafe { device.handle.cmd_blit_image2(cmd, &blit_info) };
+}
+
+pub struct ComputePushConstants {
+    pub data1: glam::Vec4,
+    pub data2: glam::Vec4,
+    pub data3: glam::Vec4,
+    pub data4: glam::Vec4,
+}
+
+/// Return a `&[u8]` for any sized object passed in.
+pub unsafe fn any_as_u8_slice<T: Sized>(any: &T) -> &[u8] {
+    let ptr = (any as *const T) as *const u8;
+    std::slice::from_raw_parts(ptr, std::mem::size_of::<T>())
+}
+
+pub struct ComputeEffect {
+    pub name: String,
+    pub pipeline: Pipeline,
+    pub data: ComputePushConstants,
 }

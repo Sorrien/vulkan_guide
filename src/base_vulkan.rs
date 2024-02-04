@@ -1,6 +1,7 @@
 use std::{
     ffi::{CStr, CString},
     fs::File,
+    mem::size_of,
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -19,7 +20,7 @@ use winit::window::Window;
 use crate::{
     ash_bootstrap, debug,
     descriptors::{Descriptor, DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
-    swapchain, AllocatedImage,
+    swapchain, AllocatedImage, ComputeEffect, ComputePushConstants,
 };
 
 pub struct BaseVulkanState {
@@ -347,13 +348,13 @@ impl BaseVulkanState {
         P: AsRef<Path>,
     {
         let mut spv_file = File::open(path).unwrap();
-        let shader_code = read_spv(&mut spv_file).expect("Failed to read vertex shader spv file");
+        let shader_code = read_spv(&mut spv_file).expect("Failed to read shader spv file");
         let vertex_shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
         let shader_module = unsafe {
             self.device
                 .handle
                 .create_shader_module(&vertex_shader_info, None)
-                .expect("Vertex shader module error")
+                .expect("shader module error")
         };
         shader_module
     }
@@ -361,37 +362,53 @@ impl BaseVulkanState {
     pub fn init_pipelines(
         &mut self,
         draw_image_descriptor_layout: vk::DescriptorSetLayout,
-    ) -> Pipeline {
-        let gradient_pipeline = self.init_background_pipelines(draw_image_descriptor_layout);
-        gradient_pipeline
+    ) -> (Vec<ComputeEffect>, Arc<PipelineLayout>) {
+        self.init_background_pipelines(draw_image_descriptor_layout)
     }
 
     pub fn init_background_pipelines(
         &mut self,
         draw_image_descriptor_layout: vk::DescriptorSetLayout,
-    ) -> Pipeline {
-        let set_layouts = [draw_image_descriptor_layout];
-        let compute_layout = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+    ) -> (Vec<ComputeEffect>, Arc<PipelineLayout>) {
+        let push_constant = vk::PushConstantRange::default()
+            .offset(0)
+            .size(size_of::<ComputePushConstants>() as u32)
+            .stage_flags(vk::ShaderStageFlags::COMPUTE);
 
-        let gradient_pipeline_layout = unsafe {
+        let set_layouts = [draw_image_descriptor_layout];
+        let push_constant_ranges = [push_constant];
+        let compute_layout_create_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts)
+            .push_constant_ranges(&push_constant_ranges);
+        /*
+        let compute_effect_pipeline_layout = unsafe {
             self.device
                 .handle
                 .create_pipeline_layout(&compute_layout, None)
         }
-        .expect("failed to create gradient pipeline layout!");
+        .expect("failed to create gradient pipeline layout!"); */
+        let compute_effect_pipeline_layout =
+            PipelineLayout::new(self.device.clone(), compute_layout_create_info)
+                .expect("failed to create compute effect pipeline layout!");
 
-        let compute_draw_shader = self.create_shader_module("shaders/gradient.comp.spv");
+        let gradient_shader = self.create_shader_module("shaders/gradient.comp.spv");
+        let sky_shader = self.create_shader_module("shaders/sky.comp.spv");
+
         let shader_entry_name = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
 
         let stage_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
-            .module(compute_draw_shader)
+            .module(gradient_shader)
             .name(shader_entry_name);
 
         let compute_pipeline_create_info = vk::ComputePipelineCreateInfo::default()
-            .layout(gradient_pipeline_layout)
+            .layout(compute_effect_pipeline_layout.handle)
             .stage(stage_info);
-        let create_infos = [compute_pipeline_create_info];
+
+        let mut sky_pipeline_create_info = compute_pipeline_create_info.clone();
+        sky_pipeline_create_info.stage.module = sky_shader;
+        let create_infos = [compute_pipeline_create_info, sky_pipeline_create_info];
+
         let pipelines = unsafe {
             self.device.handle.create_compute_pipelines(
                 vk::PipelineCache::null(),
@@ -401,20 +418,46 @@ impl BaseVulkanState {
         }
         .expect("failed to create gradient pipeline!");
         let gradient_pipeline = pipelines[0];
+        let sky_pipeline = pipelines[1];
+
+        let gradient = ComputeEffect {
+            name: String::from("gradient"),
+            pipeline: Pipeline::new(
+                self.device.clone(),
+                gradient_pipeline,
+                compute_effect_pipeline_layout.clone(),
+            ),
+            data: ComputePushConstants {
+                data1: glam::Vec4::new(1., 0., 0., 1.),
+                data2: glam::Vec4::new(0., 0., 1., 1.),
+                data3: glam::Vec4::ZERO,
+                data4: glam::Vec4::ZERO,
+            },
+        };
+
+        let sky = ComputeEffect {
+            name: String::from("gradient"),
+            pipeline: Pipeline::new(
+                self.device.clone(),
+                sky_pipeline,
+                compute_effect_pipeline_layout.clone(),
+            ),
+            data: ComputePushConstants {
+                data1: glam::Vec4::new(0.1, 0.2, 0.4, 0.97),
+                data2: glam::Vec4::ZERO,
+                data3: glam::Vec4::ZERO,
+                data4: glam::Vec4::ZERO,
+            },
+        };
 
         unsafe {
             self.device
                 .handle
-                .destroy_shader_module(compute_draw_shader, None)
+                .destroy_shader_module(gradient_shader, None);
+            self.device.handle.destroy_shader_module(sky_shader, None);
         };
 
-        let pipeline = Pipeline {
-            device: self.device.clone(),
-            pipeline: gradient_pipeline,
-            pipeline_layout: gradient_pipeline_layout,
-        };
-
-        pipeline
+        (vec![gradient, sky], compute_effect_pipeline_layout)
     }
 
     pub fn init_descriptors(
@@ -486,17 +529,57 @@ impl BaseVulkanState {
 pub struct Pipeline {
     device: Arc<LogicalDevice>,
     pub pipeline: vk::Pipeline,
-    pub pipeline_layout: vk::PipelineLayout,
+    pub pipeline_layout: Arc<PipelineLayout>,
+}
+
+impl Pipeline {
+    pub fn new(
+        device: Arc<LogicalDevice>,
+        pipeline: vk::Pipeline,
+        pipeline_layout: Arc<PipelineLayout>,
+    ) -> Self {
+        Self {
+            device,
+            pipeline,
+            pipeline_layout,
+        }
+    }
 }
 
 impl Drop for Pipeline {
     fn drop(&mut self) {
         unsafe {
+            self.device.handle.destroy_pipeline(self.pipeline, None);
+        }
+    }
+}
+
+pub struct PipelineLayout {
+    device: Arc<LogicalDevice>,
+    pub handle: vk::PipelineLayout,
+}
+
+impl PipelineLayout {
+    pub fn new(
+        device: Arc<LogicalDevice>,
+        create_info: vk::PipelineLayoutCreateInfo,
+    ) -> Result<Arc<PipelineLayout>, vk::Result> {
+        let result = unsafe { device.handle.create_pipeline_layout(&create_info, None) };
+        if let Ok(handle) = result {
+            Ok(Arc::new(Self { device, handle }))
+        } else {
+            Err(result.err().unwrap())
+        }
+    }
+}
+
+impl Drop for PipelineLayout {
+    fn drop(&mut self) {
+        unsafe {
             self.device
                 .handle
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            self.device.handle.destroy_pipeline(self.pipeline, None)
-        }
+                .destroy_pipeline_layout(self.handle, None)
+        };
     }
 }
 
