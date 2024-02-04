@@ -221,8 +221,8 @@ impl VulkanEngine {
                         .prepare_frame(imgui.io_mut(), &self.base.window)
                         .expect("failed to prepare frame!");
                     let ui = imgui.frame();
-
-                    ui.window("Hello world")
+                    ui.show_demo_window(&mut true);
+/*                     ui.window("Hello world")
                         .size([300.0, 110.0], imgui::Condition::FirstUseEver)
                         .build(|| {
                             ui.text_wrapped("Hello world!");
@@ -239,7 +239,7 @@ impl VulkanEngine {
                                 "Mouse Position: ({:.1},{:.1})",
                                 mouse_pos[0], mouse_pos[1]
                             ));
-                        });
+                        }); */
                     //ui_builder
                     platform.prepare_render(ui, &self.base.window);
                     let draw_data = imgui.render();
@@ -491,7 +491,8 @@ impl VulkanEngine {
         let rendering_info = vk::RenderingInfo::default()
             .render_area(self.swapchain.extent.into())
             .color_attachments(&color_attachments)
-            .flags(vk::RenderingFlags::CONTENTS_INLINE_EXT).layer_count(1); //todo fill this out
+            .flags(vk::RenderingFlags::CONTENTS_INLINE_EXT)
+            .layer_count(1); //todo fill this out
 
         unsafe {
             self.base
@@ -568,98 +569,6 @@ impl VulkanEngine {
         unsafe { device.wait_for_fences(&fences, true, u64::MAX) }
             .expect("failed to wait for imm submit fence!");
     }
-
-    /*     pub fn init_imgui(&self) {
-        /*         let pool_sizes = [
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::SAMPLER,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_TEXEL_BUFFER,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
-                descriptor_count: 1000,
-            },
-            vk::DescriptorPoolSize {
-                ty: vk::DescriptorType::INPUT_ATTACHMENT,
-                descriptor_count: 1000,
-            },
-        ];
-
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
-            .max_sets(1000)
-            .pool_sizes(&pool_sizes);
-
-        let imgui_pool = unsafe {
-            self.base
-                .device
-                .handle
-                .create_descriptor_pool(&pool_info, None)
-        }
-        .expect("failed to create imgui descriptor pool!"); */
-
-        let mut imgui_context = imgui::Context::create();
-
-        imgui_context.set_ini_filename(None);
-
-        let mut winit_platform = imgui_winit_support::WinitPlatform::init(&mut imgui_context);
-        let dpi_mode = imgui_winit_support::HiDpiMode::Default;
-
-        winit_platform.attach_window(imgui_context.io_mut(), &self.base.window, dpi_mode);
-        imgui_context
-            .fonts()
-            .add_font(&[imgui::FontSource::DefaultFontData { config: None }]);
-
-        //init imgui for vulkan somehow
-        let renderer = imgui_rs_vulkan_renderer::Renderer::with_gpu_allocator(
-            self.base.allocator.clone(),
-            self.base.device.handle.clone(),
-            self.base.graphics_queue,
-            self.immediate_command.command_pool,
-            DynamicRendering {
-                color_attachment_format: self.swapchain.format,
-                depth_attachment_format: None,
-            },
-            &mut imgui_context,
-            Some(imgui_rs_vulkan_renderer::Options {
-                in_flight_frames: FRAME_OVERLAP,
-                ..Default::default()
-            }),
-        )
-        .unwrap();
-    } */
 }
 
 impl Drop for VulkanEngine {

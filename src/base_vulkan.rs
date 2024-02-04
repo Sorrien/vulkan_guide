@@ -593,6 +593,7 @@ impl ImmediateCommand {
 impl Drop for ImmediateCommand {
     fn drop(&mut self) {
         unsafe {
+            self.device.handle.destroy_fence(self.fence, None);
             self.device
                 .handle
                 .destroy_command_pool(self.command_pool, None)
