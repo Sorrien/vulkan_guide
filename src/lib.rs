@@ -227,15 +227,16 @@ impl VulkanEngine {
                         .expect("failed to prepare frame!");
                     let ui = imgui.frame();
 
-                    ui.window("background").build(|| {
-                        ui.text(format!("Selected effect: {}", "test"));
+                    ui.window("background").size([500.0, 200.0], imgui::Condition::FirstUseEver).build(|| {
+                        let len = self.background_effects.len();
+                        let selected = &mut self.background_effects[self.current_background_effect];
+                        ui.text(format!("Selected effect: {}", selected.name));
                         ui.slider(
                             "Effect Index",
                             0,
-                            self.background_effects.len() - 1,
+                            len - 1,
                             &mut self.current_background_effect,
                         );
-                        let selected = &mut self.background_effects[self.current_background_effect];
                         ui.input_float4("data1", &mut selected.data.data1).build();
                         ui.input_float4("data2", &mut selected.data.data2).build();
                         ui.input_float4("data3", &mut selected.data.data3).build();

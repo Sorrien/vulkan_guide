@@ -436,7 +436,7 @@ impl BaseVulkanState {
         };
 
         let sky = ComputeEffect {
-            name: String::from("gradient"),
+            name: String::from("sky"),
             pipeline: Pipeline::new(
                 self.device.clone(),
                 sky_pipeline,
