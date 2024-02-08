@@ -30,6 +30,8 @@ pub struct VulkanEngine {
     current_background_effect: usize,
     frame_number: usize,
     //imgui_context: ImguiContext,
+    triangle_pipeline: Pipeline,
+    triangle_pipeline_layout: Arc<base_vulkan::PipelineLayout>,
     immediate_command: base_vulkan::ImmediateCommand,
     background_effects: Vec<ComputeEffect>,
     background_effect_pipeline_layout: Arc<base_vulkan::PipelineLayout>,
@@ -94,6 +96,9 @@ impl VulkanEngine {
         let (background_effects, background_effect_pipeline_layout) =
             base.init_pipelines(draw_image_descriptor.layout);
 
+        let (triangle_pipeline, triangle_pipeline_layout) =
+            base.init_triangle_pipeline(draw_image_allocated.format);
+
         let immediate_command = base.init_immediate_command();
 
         /*         let imgui_context = ImguiContext::new(
@@ -117,7 +122,8 @@ impl VulkanEngine {
             background_effect_pipeline_layout,
             immediate_command,
             current_background_effect: 0,
-            //imgui_context,
+            triangle_pipeline,
+            triangle_pipeline_layout, //imgui_context,
         }
     }
 
@@ -227,21 +233,24 @@ impl VulkanEngine {
                         .expect("failed to prepare frame!");
                     let ui = imgui.frame();
 
-                    ui.window("background").size([500.0, 200.0], imgui::Condition::FirstUseEver).build(|| {
-                        let len = self.background_effects.len();
-                        let selected = &mut self.background_effects[self.current_background_effect];
-                        ui.text(format!("Selected effect: {}", selected.name));
-                        ui.slider(
-                            "Effect Index",
-                            0,
-                            len - 1,
-                            &mut self.current_background_effect,
-                        );
-                        ui.input_float4("data1", &mut selected.data.data1).build();
-                        ui.input_float4("data2", &mut selected.data.data2).build();
-                        ui.input_float4("data3", &mut selected.data.data3).build();
-                        ui.input_float4("data4", &mut selected.data.data4).build();
-                    });
+                    ui.window("background")
+                        .size([500.0, 200.0], imgui::Condition::FirstUseEver)
+                        .build(|| {
+                            let len = self.background_effects.len();
+                            let selected =
+                                &mut self.background_effects[self.current_background_effect];
+                            ui.text(format!("Selected effect: {}", selected.name));
+                            ui.slider(
+                                "Effect Index",
+                                0,
+                                len - 1,
+                                &mut self.current_background_effect,
+                            );
+                            ui.input_float4("data1", &mut selected.data.data1).build();
+                            ui.input_float4("data2", &mut selected.data.data2).build();
+                            ui.input_float4("data3", &mut selected.data.data3).build();
+                            ui.input_float4("data4", &mut selected.data.data4).build();
+                        });
 
                     platform.prepare_render(ui, &self.base.window);
                     let draw_data = imgui.render();
@@ -329,6 +338,15 @@ impl VulkanEngine {
             cmd,
             self.draw_image.image,
             vk::ImageLayout::GENERAL,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+
+        self.draw_geometry(cmd);
+
+        self.base.transition_image_layout(
+            cmd,
+            self.draw_image.image,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         );
         self.base.transition_image_layout(
@@ -509,7 +527,7 @@ impl VulkanEngine {
             .render_area(self.swapchain.extent.into())
             .color_attachments(&color_attachments)
             .flags(vk::RenderingFlags::CONTENTS_INLINE_EXT)
-            .layer_count(1); //todo fill this out
+            .layer_count(1);
 
         unsafe {
             self.base
@@ -585,6 +603,51 @@ impl VulkanEngine {
         let fences = [self.immediate_command.fence];
         unsafe { device.wait_for_fences(&fences, true, u64::MAX) }
             .expect("failed to wait for imm submit fence!");
+    }
+
+    fn draw_geometry(&self, cmd: vk::CommandBuffer) {
+        let color_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(self.draw_image.image_view)
+            .image_layout(vk::ImageLayout::GENERAL);
+
+        let color_attachments = [color_attachment];
+        let rendering_info = vk::RenderingInfo::default()
+            .render_area(self.swapchain.extent.into())
+            .color_attachments(&color_attachments)
+            .layer_count(1);
+
+        unsafe {
+            self.base
+                .device
+                .handle
+                .cmd_begin_rendering(cmd, &rendering_info)
+        };
+
+        unsafe {
+            self.base.device.handle.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.triangle_pipeline.pipeline,
+            )
+        };
+
+        let viewport = vk::Viewport::default()
+            .x(0.)
+            .y(0.)
+            .width(self.draw_image.extent.width as f32)
+            .height(self.draw_image.extent.height as f32)
+            .min_depth(0.)
+            .max_depth(1.);
+        let viewports = [viewport];
+        unsafe { self.base.device.handle.cmd_set_viewport(cmd, 0, &viewports) };
+
+        let scissor = vk::Rect2D::default().extent(self.draw_image.extent);
+        let scissors = [scissor];
+        unsafe { self.base.device.handle.cmd_set_scissor(cmd, 0, &scissors) };
+
+        unsafe { self.base.device.handle.cmd_draw(cmd, 3, 1, 0, 0) };
+
+        unsafe { self.base.device.handle.cmd_end_rendering(cmd) };
     }
 }
 
