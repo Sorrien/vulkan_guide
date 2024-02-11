@@ -69,7 +69,6 @@ pub struct PipelineBuilder<'a> {
     multisampling: vk::PipelineMultisampleStateCreateInfo<'a>,
     pipeline_layout: Arc<PipelineLayout>,
     depth_stencil: vk::PipelineDepthStencilStateCreateInfo<'a>,
-    //render_info: vk::PipelineRenderingCreateInfo<'a>,
     color_attachment_format: vk::Format,
     depth_attachment_format: vk::Format,
 }
@@ -84,7 +83,6 @@ impl PipelineBuilder<'_> {
             multisampling: vk::PipelineMultisampleStateCreateInfo::default(),
             pipeline_layout,
             depth_stencil: vk::PipelineDepthStencilStateCreateInfo::default(),
-            //render_info: vk::PipelineRenderingCreateInfo::default(),
             color_attachment_format: vk::Format::default(),
             depth_attachment_format: vk::Format::default(),
         }
@@ -116,8 +114,7 @@ impl PipelineBuilder<'_> {
             .input_assembly
             .topology(topology)
             .primitive_restart_enable(false);
-        // we are not going to use primitive restart on the entire tutorial so leave
-        // it on false
+        // we are not going to use primitive restart on the entire tutorial so leave it on false
         self
     }
 

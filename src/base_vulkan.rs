@@ -121,7 +121,7 @@ impl BaseVulkanState {
             device: device.handle.clone(),
             physical_device: bootstrap_physical_device.physical_device.clone(),
             debug_settings: Default::default(),
-            buffer_device_address: true, // Ideally, check the BufferDeviceAddressFeatures struct.
+            buffer_device_address: features12.buffer_device_address == 1,
             allocation_sizes: Default::default(),
         })
         .expect("failed to create allocator!");

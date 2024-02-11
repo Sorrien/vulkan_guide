@@ -35,7 +35,6 @@ const FRAME_OVERLAP: usize = 2;
 pub struct VulkanEngine {
     current_background_effect: usize,
     frame_number: usize,
-    //imgui_context: ImguiContext,
     meshes: Vec<GPUMeshBuffers>,
     mesh_pipeline: Pipeline,
     mesh_pipeline_layout: Arc<PipelineLayout>,
@@ -141,7 +140,6 @@ impl VulkanEngine {
             Vertex::new(glam::vec3(0.5, 0.5, 0.), glam::vec4(0., 0., 1., 1.)),
             Vertex::new(glam::vec3(-0.5, 0.5, 0.), glam::vec4(1.0, 1.0, 1.0, 1.)),
         ];
-        //let indices = vec![0, 1, 2, 2, 1, 3];
         let indices = vec![0, 1, 2, 2, 3, 0];
 
         let rectangle = self.upload_mesh(indices, vertices);
@@ -206,10 +204,6 @@ impl VulkanEngine {
         mut imgui_renderer: imgui_rs_vulkan_renderer::Renderer,
     ) -> Result<(), winit::error::EventLoopError> {
         let mut last_frame = Instant::now();
-        let mut stop_rendering = false;
-
-        let mut value = 0;
-        let choices = ["test test this is 1", "test test this is 2"];
 
         event_loop.run(move |event, elwt| {
             platform.handle_event(imgui.io_mut(), &self.base.window, &event);
@@ -266,7 +260,7 @@ impl VulkanEngine {
                     let draw_data = imgui.render();
 
                     //don't attempt to draw a frame in window size is 0
-                    if size.height > 0 && size.width > 0 && !stop_rendering {
+                    if size.height > 0 && size.width > 0 {
                         self.draw(draw_data, &mut imgui_renderer);
                     }
                 }
@@ -727,48 +721,6 @@ impl VulkanEngine {
             vertex_buffer,
             vertex_buffer_address,
         };
-
-        /*
-        //at the moment I don't have a good way to do this with one staging buffer.
-        let staging_buffer = self.base.create_buffer(
-            "index_vertex_staging_buffer",
-            vertex_buffer_size + index_buffer_size,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            MemoryLocation::CpuToGpu,
-        );
-
-        copy_to_staging_buffer(&staging_buffer, vertex_buffer_size as u64, &vertices);
-        copy_to_staging_buffer(&staging_buffer, index_buffer_size as u64, &indices);
-
-        self.immediate_submit(|cmd| {
-            let vertex_copy = vk::BufferCopy::default()
-                .dst_offset(0)
-                .src_offset(0)
-                .size(vertex_buffer_size as u64);
-            let vertex_regions = [vertex_copy];
-            unsafe {
-                self.base.device.handle.cmd_copy_buffer(
-                    cmd,
-                    staging_buffer.buffer,
-                    new_surface.vertex_buffer.buffer,
-                    &vertex_regions,
-                )
-            };
-
-            let index_copy = vk::BufferCopy::default()
-                .dst_offset(0)
-                .src_offset(vertex_buffer_size as u64)
-                .size(index_buffer_size as u64);
-            let index_regions = [index_copy];
-            unsafe {
-                self.base.device.handle.cmd_copy_buffer(
-                    cmd,
-                    staging_buffer.buffer,
-                    new_surface.index_buffer.buffer,
-                    &index_regions,
-                )
-            };
-        }); */
 
         let vertex_staging_buffer = self.base.create_buffer(
             "vertex_staging_buffer",
