@@ -1,6 +1,6 @@
 #version 450
 
-layout (location = 0) out vec3 outColor;
+layout (location = 0) out vec4 outColor;
 
 void main() 
 {
@@ -12,10 +12,10 @@ void main()
 	);
 
 	//const array of colors for the triangle
-	const vec3 colors[3] = vec3[3](
-		vec3(1.0f, 0.0f, 0.0f), //red
-		vec3(0.0f, 1.0f, 0.0f), //green
-		vec3(00.f, 0.0f, 1.0f)  //blue
+	const vec4 colors[3] = vec4[3](
+		vec4(1.0f, 0.0f, 0.0f, 1.0f), //red
+		vec4(0.0f, 1.0f, 0.0f, 1.0f), //green
+		vec4(00.f, 0.0f, 1.0f, 1.0f)  //blue
 	);
 
 	//output the position of each vertex

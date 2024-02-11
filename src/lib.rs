@@ -1,5 +1,4 @@
 use std::{
-    ffi::CStr,
     mem::{size_of, ManuallyDrop},
     sync::{Arc, Mutex},
     time::Instant,
@@ -7,22 +6,29 @@ use std::{
 
 use ash::vk;
 use ash_bootstrap::LogicalDevice;
-use base_vulkan::{BaseVulkanState, FrameData, Pipeline};
-use descriptors::{Descriptor, DescriptorAllocator, PoolSizeRatio};
-use gpu_allocator::vulkan::*;
-use imgui_rs_vulkan_renderer::DynamicRendering;
+use base_vulkan::{BaseVulkanState, FrameData};
+use buffers::{copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, Vertex};
+use descriptors::{Descriptor, DescriptorAllocator};
+use gpu_allocator::{vulkan::*, MemoryLocation};
+use pipelines::Pipeline;
 use swapchain::MySwapchain;
+use vk_imgui::init_imgui;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::EventLoop,
     window::{Window, WindowBuilder},
 };
 
+use crate::pipelines::PipelineLayout;
+
 pub mod ash_bootstrap;
 pub mod base_vulkan;
+pub mod buffers;
 pub mod debug;
 pub mod descriptors;
+pub mod pipelines;
 pub mod swapchain;
+pub mod vk_imgui;
 
 const FRAME_OVERLAP: usize = 2;
 
@@ -30,11 +36,14 @@ pub struct VulkanEngine {
     current_background_effect: usize,
     frame_number: usize,
     //imgui_context: ImguiContext,
+    meshes: Vec<GPUMeshBuffers>,
+    mesh_pipeline: Pipeline,
+    mesh_pipeline_layout: Arc<PipelineLayout>,
     triangle_pipeline: Pipeline,
-    triangle_pipeline_layout: Arc<base_vulkan::PipelineLayout>,
+    triangle_pipeline_layout: Arc<PipelineLayout>,
     immediate_command: base_vulkan::ImmediateCommand,
     background_effects: Vec<ComputeEffect>,
-    background_effect_pipeline_layout: Arc<base_vulkan::PipelineLayout>,
+    background_effect_pipeline_layout: Arc<PipelineLayout>,
     draw_image_descriptor: Descriptor,
     global_descriptor_allocator: descriptors::DescriptorAllocator,
     draw_image: AllocatedImage,
@@ -99,16 +108,11 @@ impl VulkanEngine {
         let (triangle_pipeline, triangle_pipeline_layout) =
             base.init_triangle_pipeline(draw_image_allocated.format);
 
-        let immediate_command = base.init_immediate_command();
+        let (mesh_pipeline, mesh_pipeline_layout) =
+            base.init_mesh_pipeline(draw_image_allocated.format);
 
-        /*         let imgui_context = ImguiContext::new(
-            &base.window,
-            &base.allocator,
-            &base.device,
-            base.graphics_queue,
-            immediate_command.command_pool,
-            swapchain.format,
-        ); */
+        let immediate_command = base.init_immediate_command();
+        let meshes = vec![];
 
         Self {
             base,
@@ -123,20 +127,26 @@ impl VulkanEngine {
             immediate_command,
             current_background_effect: 0,
             triangle_pipeline,
-            triangle_pipeline_layout, //imgui_context,
+            triangle_pipeline_layout,
+            mesh_pipeline,
+            mesh_pipeline_layout,
+            meshes,
         }
     }
 
-    /* pub fn init_imgui(&self) -> ImguiContext {
-        ImguiContext::new(
-            &self.base.window,
-            &self.base.allocator,
-            &self.base.device,
-            self.base.graphics_queue,
-            self.immediate_command.command_pool,
-            self.swapchain.format,
-        )
-    } */
+    pub fn init_default_data(&mut self) {
+        let vertices = vec![
+            Vertex::new(glam::vec3(-0.5, -0.5, 0.), glam::vec4(1., 0., 0., 1.)),
+            Vertex::new(glam::vec3(0.5, -0.5, 0.), glam::vec4(0.0, 1.0, 0.0, 1.)),
+            Vertex::new(glam::vec3(0.5, 0.5, 0.), glam::vec4(0., 0., 1., 1.)),
+            Vertex::new(glam::vec3(-0.5, 0.5, 0.), glam::vec4(1.0, 1.0, 1.0, 1.)),
+        ];
+        //let indices = vec![0, 1, 2, 2, 1, 3];
+        let indices = vec![0, 1, 2, 2, 3, 0];
+
+        let rectangle = self.upload_mesh(indices, vertices);
+        self.meshes.push(rectangle);
+    }
 
     pub fn init_imgui(
         &self,
@@ -568,18 +578,21 @@ impl VulkanEngine {
 
     pub fn immediate_submit<F: FnOnce(vk::CommandBuffer)>(&self, f: F) {
         let fences = [self.immediate_command.fence];
-        unsafe { self.base.device.handle.reset_fences(&fences) }
-            .expect("failed to reset immediate submit fence!");
-        unsafe {
-            self.base.device.handle.reset_command_buffer(
-                self.immediate_command.command_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )
-        }
-        .expect("failed to reset imm submit cmd buffer!");
-
         let cmd = self.immediate_command.command_buffer;
         let device = &self.base.device.handle;
+
+        unsafe { device.reset_fences(&fences) }.expect("failed to reset immediate submit fence!");
+        unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }
+            .expect("failed to reset imm submit cmd buffer!");
+
+        unsafe {
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .expect("failed to end imm submit cmd buffer!");
 
         f(cmd);
 
@@ -612,7 +625,7 @@ impl VulkanEngine {
 
         let color_attachments = [color_attachment];
         let rendering_info = vk::RenderingInfo::default()
-            .render_area(self.swapchain.extent.into())
+            .render_area(self.draw_image.extent.into())
             .color_attachments(&color_attachments)
             .layer_count(1);
 
@@ -647,7 +660,164 @@ impl VulkanEngine {
 
         unsafe { self.base.device.handle.cmd_draw(cmd, 3, 1, 0, 0) };
 
+        unsafe {
+            self.base.device.handle.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.mesh_pipeline.pipeline,
+            )
+        };
+
+        for mesh in &self.meshes {
+            let draw_push_constants =
+                GPUDrawPushConstants::new(glam::Mat4::IDENTITY, mesh.vertex_buffer_address);
+
+            let pc = [draw_push_constants];
+            unsafe {
+                let push = any_as_u8_slice(&pc);
+                self.base.device.handle.cmd_push_constants(
+                    cmd,
+                    self.mesh_pipeline_layout.handle,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    &push,
+                )
+            };
+
+            unsafe {
+                self.base.device.handle.cmd_bind_index_buffer(
+                    cmd,
+                    mesh.index_buffer.buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                )
+            };
+
+            unsafe { self.base.device.handle.cmd_draw_indexed(cmd, 6, 1, 0, 0, 0) };
+        }
         unsafe { self.base.device.handle.cmd_end_rendering(cmd) };
+    }
+
+    fn upload_mesh(&self, indices: Vec<u32>, vertices: Vec<Vertex>) -> GPUMeshBuffers {
+        let vertex_buffer_size = vertices.len() * size_of::<Vertex>();
+        let index_buffer_size = indices.len() * size_of::<u32>();
+
+        let vertex_buffer = self.base.create_buffer(
+            "vertex buffer",
+            vertex_buffer_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            MemoryLocation::GpuOnly,
+        );
+
+        let info = vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.buffer);
+        let vertex_buffer_address: vk::DeviceAddress =
+            unsafe { self.base.device.handle.get_buffer_device_address(&info) };
+
+        let index_buffer = self.base.create_buffer(
+            "index buffer",
+            index_buffer_size,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+        );
+
+        let new_surface = GPUMeshBuffers {
+            index_buffer,
+            vertex_buffer,
+            vertex_buffer_address,
+        };
+
+        /*
+        //at the moment I don't have a good way to do this with one staging buffer.
+        let staging_buffer = self.base.create_buffer(
+            "index_vertex_staging_buffer",
+            vertex_buffer_size + index_buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+        );
+
+        copy_to_staging_buffer(&staging_buffer, vertex_buffer_size as u64, &vertices);
+        copy_to_staging_buffer(&staging_buffer, index_buffer_size as u64, &indices);
+
+        self.immediate_submit(|cmd| {
+            let vertex_copy = vk::BufferCopy::default()
+                .dst_offset(0)
+                .src_offset(0)
+                .size(vertex_buffer_size as u64);
+            let vertex_regions = [vertex_copy];
+            unsafe {
+                self.base.device.handle.cmd_copy_buffer(
+                    cmd,
+                    staging_buffer.buffer,
+                    new_surface.vertex_buffer.buffer,
+                    &vertex_regions,
+                )
+            };
+
+            let index_copy = vk::BufferCopy::default()
+                .dst_offset(0)
+                .src_offset(vertex_buffer_size as u64)
+                .size(index_buffer_size as u64);
+            let index_regions = [index_copy];
+            unsafe {
+                self.base.device.handle.cmd_copy_buffer(
+                    cmd,
+                    staging_buffer.buffer,
+                    new_surface.index_buffer.buffer,
+                    &index_regions,
+                )
+            };
+        }); */
+
+        let vertex_staging_buffer = self.base.create_buffer(
+            "vertex_staging_buffer",
+            vertex_buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+        );
+        copy_to_staging_buffer(&vertex_staging_buffer, vertex_buffer_size as u64, &vertices);
+
+        let index_staging_buffer = self.base.create_buffer(
+            "index_staging_buffer_staging_buffer",
+            index_buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+        );
+
+        copy_to_staging_buffer(&index_staging_buffer, index_buffer_size as u64, &indices);
+
+        self.immediate_submit(|cmd| {
+            let vertex_copy = vk::BufferCopy::default()
+                .dst_offset(0)
+                .src_offset(0)
+                .size(vertex_buffer_size as u64);
+            let vertex_regions = [vertex_copy];
+            unsafe {
+                self.base.device.handle.cmd_copy_buffer(
+                    cmd,
+                    vertex_staging_buffer.buffer,
+                    new_surface.vertex_buffer.buffer,
+                    &vertex_regions,
+                )
+            };
+
+            let index_copy = vk::BufferCopy::default()
+                .dst_offset(0)
+                .src_offset(0)
+                .size(index_buffer_size as u64);
+            let index_regions = [index_copy];
+            unsafe {
+                self.base.device.handle.cmd_copy_buffer(
+                    cmd,
+                    index_staging_buffer.buffer,
+                    new_surface.index_buffer.buffer,
+                    &index_regions,
+                )
+            };
+        });
+
+        new_surface
     }
 }
 
@@ -656,102 +826,6 @@ impl Drop for VulkanEngine {
         unsafe { self.base.device.handle.device_wait_idle() }
             .expect("failed to wait for device idle!");
     }
-}
-
-pub struct ImguiContext {
-    pub renderer: imgui_rs_vulkan_renderer::Renderer,
-    pub platform: imgui_winit_support::WinitPlatform,
-    pub imgui: imgui::Context,
-}
-
-impl ImguiContext {
-    pub fn new(
-        window: &Window,
-        allocator: &Arc<Mutex<Allocator>>,
-        device: &Arc<LogicalDevice>,
-        graphics_queue: vk::Queue,
-        command_pool: vk::CommandPool,
-        format: vk::Format,
-    ) -> Self {
-        let mut imgui = imgui::Context::create();
-
-        imgui.set_ini_filename(None);
-
-        let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
-        let dpi_mode = imgui_winit_support::HiDpiMode::Default;
-
-        platform.attach_window(imgui.io_mut(), window, dpi_mode);
-        imgui
-            .fonts()
-            .add_font(&[imgui::FontSource::DefaultFontData { config: None }]);
-
-        let renderer = imgui_rs_vulkan_renderer::Renderer::with_gpu_allocator(
-            allocator.clone(),
-            device.handle.clone(),
-            graphics_queue,
-            command_pool,
-            DynamicRendering {
-                color_attachment_format: format,
-                depth_attachment_format: None,
-            },
-            &mut imgui,
-            Some(imgui_rs_vulkan_renderer::Options {
-                in_flight_frames: FRAME_OVERLAP,
-                ..Default::default()
-            }),
-        )
-        .unwrap();
-
-        Self {
-            renderer,
-            platform,
-            imgui,
-        }
-    }
-}
-
-pub fn init_imgui(
-    window: &Window,
-    allocator: &Arc<Mutex<Allocator>>,
-    device: &Arc<LogicalDevice>,
-    graphics_queue: vk::Queue,
-    command_pool: vk::CommandPool,
-    format: vk::Format,
-) -> (
-    imgui::Context,
-    imgui_winit_support::WinitPlatform,
-    imgui_rs_vulkan_renderer::Renderer,
-) {
-    let mut imgui = imgui::Context::create();
-
-    imgui.set_ini_filename(None);
-
-    let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
-    let dpi_mode = imgui_winit_support::HiDpiMode::Default;
-
-    platform.attach_window(imgui.io_mut(), window, dpi_mode);
-    imgui
-        .fonts()
-        .add_font(&[imgui::FontSource::DefaultFontData { config: None }]);
-
-    let renderer = imgui_rs_vulkan_renderer::Renderer::with_gpu_allocator(
-        allocator.clone(),
-        device.handle.clone(),
-        graphics_queue,
-        command_pool,
-        DynamicRendering {
-            color_attachment_format: format,
-            depth_attachment_format: None,
-        },
-        &mut imgui,
-        Some(imgui_rs_vulkan_renderer::Options {
-            in_flight_frames: FRAME_OVERLAP,
-            ..Default::default()
-        }),
-    )
-    .unwrap();
-
-    (imgui, platform, renderer)
 }
 
 pub struct AllocatedImage {
