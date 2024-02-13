@@ -9,7 +9,6 @@ use ash_bootstrap::LogicalDevice;
 use base_vulkan::{BaseVulkanState, FrameData};
 use buffers::{copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, MeshAsset, Vertex};
 use descriptors::{Descriptor, DescriptorAllocator};
-use gltf::iter::Meshes;
 use gpu_allocator::{vulkan::*, MemoryLocation};
 use pipelines::Pipeline;
 use swapchain::MySwapchain;
