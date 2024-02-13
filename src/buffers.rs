@@ -86,14 +86,15 @@ pub fn copy_to_staging_buffer<DataType: std::marker::Copy>(
     align.copy_from_slice(&data);
 }
 
+//#[repr(C)] keeps our Vertex in the correct format for our shaders.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct Vertex {
-    position: glam::Vec3,
-    uv_x: f32,
-    normal: glam::Vec3,
-    uv_y: f32,
-    color: glam::Vec4,
+    pub position: glam::Vec3,
+    pub uv_x: f32,
+    pub normal: glam::Vec3,
+    pub uv_y: f32,
+    pub color: glam::Vec4,
 }
 
 impl Vertex {
@@ -101,7 +102,7 @@ impl Vertex {
         Self {
             position,
             uv_x: 0.,
-            normal: glam::Vec3::ZERO,
+            normal: glam::Vec3::new(1., 0., 0.),
             uv_y: 0.,
             color,
         }
@@ -120,6 +121,18 @@ macro_rules! offset_of {
     }};
 }
 pub use offset_of;
+
+pub struct GeoSurface {
+    pub start_index: usize,
+    pub count: usize,
+}
+
+pub struct MeshAsset {
+    pub name: String,
+
+    pub surfaces: Vec<GeoSurface>,
+    pub mesh_buffers: GPUMeshBuffers,
+}
 
 pub struct GPUMeshBuffers {
     pub index_buffer: AllocatedBuffer,

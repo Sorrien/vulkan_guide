@@ -25,6 +25,10 @@ imgui-rs-vulkan-renderer = { git = "https://github.com/Sorrien/imgui-rs-vulkan-r
     "dynamic-rendering",
 ] }
 
+[dependencies.gltf]
+version = "1"
+features = ["names"]
+
 [features]
 validation_layers = []
 

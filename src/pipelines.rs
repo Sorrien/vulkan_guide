@@ -162,12 +162,32 @@ impl PipelineBuilder<'_> {
         self
     }
 
+    pub fn enable_depth_test(
+        mut self,
+        depth_write_enable: bool,
+        depth_compare_op: vk::CompareOp,
+    ) -> Self {
+        self.depth_stencil = self
+            .depth_stencil
+            .depth_test_enable(true)
+            .depth_write_enable(depth_write_enable)
+            .depth_compare_op(depth_compare_op)
+            .depth_bounds_test_enable(false)
+            .stencil_test_enable(false)
+            .front(vk::StencilOpState::default())
+            .back(vk::StencilOpState::default())
+            .min_depth_bounds(0.)
+            .max_depth_bounds(1.);
+        self
+    }
+
     pub fn disable_depth_test(mut self) -> Self {
         self.depth_stencil = self
             .depth_stencil
             .depth_test_enable(false)
             .depth_write_enable(false)
             .depth_compare_op(vk::CompareOp::NEVER)
+            .depth_bounds_test_enable(false)
             .stencil_test_enable(false)
             .front(vk::StencilOpState::default())
             .back(vk::StencilOpState::default())

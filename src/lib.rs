@@ -7,8 +7,9 @@ use std::{
 use ash::vk;
 use ash_bootstrap::LogicalDevice;
 use base_vulkan::{BaseVulkanState, FrameData};
-use buffers::{copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, Vertex};
+use buffers::{copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, MeshAsset, Vertex};
 use descriptors::{Descriptor, DescriptorAllocator};
+use gltf::iter::Meshes;
 use gpu_allocator::{vulkan::*, MemoryLocation};
 use pipelines::Pipeline;
 use swapchain::MySwapchain;
@@ -26,6 +27,7 @@ pub mod base_vulkan;
 pub mod buffers;
 pub mod debug;
 pub mod descriptors;
+pub mod loader;
 pub mod pipelines;
 pub mod swapchain;
 pub mod vk_imgui;
@@ -35,17 +37,16 @@ const FRAME_OVERLAP: usize = 2;
 pub struct VulkanEngine {
     current_background_effect: usize,
     frame_number: usize,
-    meshes: Vec<GPUMeshBuffers>,
+    meshes: Vec<MeshAsset>,
     mesh_pipeline: Pipeline,
     mesh_pipeline_layout: Arc<PipelineLayout>,
-    triangle_pipeline: Pipeline,
-    triangle_pipeline_layout: Arc<PipelineLayout>,
     immediate_command: base_vulkan::ImmediateCommand,
     background_effects: Vec<ComputeEffect>,
     background_effect_pipeline_layout: Arc<PipelineLayout>,
     draw_image_descriptor: Descriptor,
     global_descriptor_allocator: descriptors::DescriptorAllocator,
     draw_image: AllocatedImage,
+    depth_image: AllocatedImage,
     frames: Vec<Arc<FrameData>>,
     pub swapchain: MySwapchain,
     base: BaseVulkanState,
@@ -96,6 +97,34 @@ impl VulkanEngine {
             allocator: base.allocator.clone(),
         };
 
+        let depth_image_format = vk::Format::D32_SFLOAT;
+        let (depth_image, depth_image_allocation) = base.create_image(
+            draw_image_extent,
+            depth_image_format,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            gpu_allocator::MemoryLocation::GpuOnly,
+            1,
+            vk::SampleCountFlags::TYPE_1,
+        );
+
+        let depth_image_view = base.create_image_view(
+            depth_image,
+            depth_image_format,
+            vk::ImageAspectFlags::DEPTH,
+            1,
+        );
+
+        let depth_image_allocated = AllocatedImage {
+            image: depth_image,
+            image_view: depth_image_view,
+            extent: draw_image_extent.into(),
+            format: depth_image_format,
+            allocation: ManuallyDrop::new(depth_image_allocation),
+            device: base.device.clone(),
+            allocator: base.allocator.clone(),
+        };
+
         let mut global_descriptor_allocator = DescriptorAllocator::new(base.device.clone());
 
         let draw_image_descriptor =
@@ -104,11 +133,8 @@ impl VulkanEngine {
         let (background_effects, background_effect_pipeline_layout) =
             base.init_pipelines(draw_image_descriptor.layout);
 
-        let (triangle_pipeline, triangle_pipeline_layout) =
-            base.init_triangle_pipeline(draw_image_allocated.format);
-
         let (mesh_pipeline, mesh_pipeline_layout) =
-            base.init_mesh_pipeline(draw_image_allocated.format);
+            base.init_mesh_pipeline(draw_image_allocated.format, depth_image_allocated.format);
 
         let immediate_command = base.init_immediate_command();
         let meshes = vec![];
@@ -125,15 +151,18 @@ impl VulkanEngine {
             background_effect_pipeline_layout,
             immediate_command,
             current_background_effect: 0,
-            triangle_pipeline,
-            triangle_pipeline_layout,
             mesh_pipeline,
             mesh_pipeline_layout,
             meshes,
+            depth_image: depth_image_allocated,
         }
     }
 
     pub fn init_default_data(&mut self) {
+        if let Some(mut meshes) = loader::load_gltf_meshes(self, "assets/basicmesh.glb") {
+            self.meshes.append(&mut meshes);
+        }
+        /*
         let vertices = vec![
             Vertex::new(glam::vec3(-0.5, -0.5, 0.), glam::vec4(1., 0., 0., 1.)),
             Vertex::new(glam::vec3(0.5, -0.5, 0.), glam::vec4(0.0, 1.0, 0.0, 1.)),
@@ -141,9 +170,9 @@ impl VulkanEngine {
             Vertex::new(glam::vec3(-0.5, 0.5, 0.), glam::vec4(1.0, 1.0, 1.0, 1.)),
         ];
         let indices = vec![0, 1, 2, 2, 3, 0];
-
         let rectangle = self.upload_mesh(indices, vertices);
         self.meshes.push(rectangle);
+         */
     }
 
     pub fn init_imgui(
@@ -343,6 +372,12 @@ impl VulkanEngine {
             self.draw_image.image,
             vk::ImageLayout::GENERAL,
             vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
+        self.base.transition_image_layout(
+            cmd,
+            self.depth_image.image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
         );
 
         self.draw_geometry(cmd);
@@ -616,11 +651,20 @@ impl VulkanEngine {
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.draw_image.image_view)
             .image_layout(vk::ImageLayout::GENERAL);
+        let mut depth_clear_value = vk::ClearValue::default();
+        depth_clear_value.depth_stencil.depth = 0.;
+        let depth_attachment = vk::RenderingAttachmentInfo::default()
+            .image_view(self.depth_image.image_view)
+            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .clear_value(depth_clear_value);
 
         let color_attachments = [color_attachment];
         let rendering_info = vk::RenderingInfo::default()
             .render_area(self.draw_image.extent.into())
             .color_attachments(&color_attachments)
+            .depth_attachment(&depth_attachment)
             .layer_count(1);
 
         unsafe {
@@ -628,14 +672,6 @@ impl VulkanEngine {
                 .device
                 .handle
                 .cmd_begin_rendering(cmd, &rendering_info)
-        };
-
-        unsafe {
-            self.base.device.handle.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.triangle_pipeline.pipeline,
-            )
         };
 
         let viewport = vk::Viewport::default()
@@ -652,8 +688,6 @@ impl VulkanEngine {
         let scissors = [scissor];
         unsafe { self.base.device.handle.cmd_set_scissor(cmd, 0, &scissors) };
 
-        unsafe { self.base.device.handle.cmd_draw(cmd, 3, 1, 0, 0) };
-
         unsafe {
             self.base.device.handle.cmd_bind_pipeline(
                 cmd,
@@ -662,33 +696,58 @@ impl VulkanEngine {
             )
         };
 
-        for mesh in &self.meshes {
-            let draw_push_constants =
-                GPUDrawPushConstants::new(glam::Mat4::IDENTITY, mesh.vertex_buffer_address);
+        //for mesh in &self.meshes {
+        let mesh = &self.meshes[2];
 
-            let pc = [draw_push_constants];
-            unsafe {
-                let push = any_as_u8_slice(&pc);
-                self.base.device.handle.cmd_push_constants(
-                    cmd,
-                    self.mesh_pipeline_layout.handle,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    &push,
-                )
-            };
+        let view = glam::Mat4::look_at_rh(
+            glam::Vec3::new(0., 0., -5.),
+            glam::Vec3::new(0., 0., 0.),
+            glam::Vec3::Y,
+        );
+        let mut proj = glam::Mat4::perspective_rh_gl(
+            70.,
+            self.draw_image.extent.width as f32 / self.draw_image.extent.height as f32,
+            0.1,
+            10000.,
+        );
+        proj.y_axis *= -1.;
 
-            unsafe {
-                self.base.device.handle.cmd_bind_index_buffer(
-                    cmd,
-                    mesh.index_buffer.buffer,
-                    0,
-                    vk::IndexType::UINT32,
-                )
-            };
+        let draw_push_constants =
+            GPUDrawPushConstants::new(proj * view, mesh.mesh_buffers.vertex_buffer_address);
 
-            unsafe { self.base.device.handle.cmd_draw_indexed(cmd, 6, 1, 0, 0, 0) };
-        }
+        let pc = [draw_push_constants];
+        unsafe {
+            let push = any_as_u8_slice(&pc);
+            self.base.device.handle.cmd_push_constants(
+                cmd,
+                self.mesh_pipeline_layout.handle,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &push,
+            )
+        };
+
+        unsafe {
+            self.base.device.handle.cmd_bind_index_buffer(
+                cmd,
+                mesh.mesh_buffers.index_buffer.buffer,
+                0,
+                vk::IndexType::UINT32,
+            )
+        };
+
+        unsafe {
+            self.base.device.handle.cmd_draw_indexed(
+                cmd,
+                mesh.surfaces[0].count as u32,
+                1,
+                mesh.surfaces[0].start_index as u32,
+                0,
+                0,
+            )
+        };
+        //}
+
         unsafe { self.base.device.handle.cmd_end_rendering(cmd) };
     }
 

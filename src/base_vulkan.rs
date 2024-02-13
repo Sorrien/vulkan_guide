@@ -534,47 +534,10 @@ impl BaseVulkanState {
         ImmediateCommand::new(self.device.clone(), fence, command_buffer, command_pool)
     }
 
-    pub fn init_triangle_pipeline(
-        &self,
-        draw_image_format: vk::Format,
-    ) -> (Pipeline, Arc<PipelineLayout>) {
-        let triangle_vert_shader = self.create_shader_module("shaders/colored_triangle.vert.spv");
-        let triangle_frag_shader = self.create_shader_module("shaders/colored_triangle.frag.spv");
-
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
-
-        let pipeline_layout = PipelineLayout::new(self.device.clone(), pipeline_layout_info)
-            .expect("failed to create triangle pipeline layout!");
-
-        let vk_pipeline = PipelineBuilder::new(pipeline_layout.clone())
-            .set_shaders(triangle_vert_shader, triangle_frag_shader)
-            .set_input_topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .set_polygon_mode(vk::PolygonMode::FILL)
-            .set_cull_mode(vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
-            .set_multisampling_none()
-            .disable_blending()
-            .disable_depth_test()
-            .set_color_attachment_format(draw_image_format)
-            .set_depth_attachment_format(vk::Format::UNDEFINED)
-            .build_pipeline(self.device.clone())
-            .expect("failed to create triangle pipeline!");
-        let pipeline = Pipeline::new(self.device.clone(), vk_pipeline, pipeline_layout.clone());
-
-        unsafe {
-            self.device
-                .handle
-                .destroy_shader_module(triangle_vert_shader, None);
-            self.device
-                .handle
-                .destroy_shader_module(triangle_frag_shader, None);
-        }
-
-        (pipeline, pipeline_layout)
-    }
-
     pub fn init_mesh_pipeline(
         &self,
         draw_image_format: vk::Format,
+        depth_image_format: vk::Format,
     ) -> (Pipeline, Arc<PipelineLayout>) {
         let triangle_vert_shader =
             self.create_shader_module("shaders/colored_triangle_mesh.vert.spv");
@@ -599,9 +562,9 @@ impl BaseVulkanState {
             .set_cull_mode(vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
             .set_multisampling_none()
             .disable_blending()
-            .disable_depth_test()
+            .enable_depth_test(true, vk::CompareOp::GREATER_OR_EQUAL)
             .set_color_attachment_format(draw_image_format)
-            .set_depth_attachment_format(vk::Format::UNDEFINED)
+            .set_depth_attachment_format(depth_image_format)
             .build_pipeline(self.device.clone())
             .expect("failed to create triangle pipeline!");
         let pipeline = Pipeline::new(self.device.clone(), vk_pipeline, pipeline_layout.clone());
