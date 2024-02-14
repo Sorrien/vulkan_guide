@@ -152,6 +152,34 @@ impl PipelineBuilder<'_> {
         self
     }
 
+    pub fn enable_blending_additive(mut self) -> Self {
+        self.color_blend_attachment = self
+            .color_blend_attachment
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::DST_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD);
+        self
+    }
+
+    pub fn enable_blending_alphablend(mut self) -> Self {
+        self.color_blend_attachment = self
+            .color_blend_attachment
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE_MINUS_DST_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::DST_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD);
+        self
+    }
+
     pub fn set_color_attachment_format(mut self, format: vk::Format) -> Self {
         self.color_attachment_format = format;
         self

@@ -561,7 +561,7 @@ impl BaseVulkanState {
             .set_polygon_mode(vk::PolygonMode::FILL)
             .set_cull_mode(vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
             .set_multisampling_none()
-            .disable_blending()
+            .enable_blending_additive()
             .enable_depth_test(true, vk::CompareOp::GREATER_OR_EQUAL)
             .set_color_attachment_format(draw_image_format)
             .set_depth_attachment_format(depth_image_format)
