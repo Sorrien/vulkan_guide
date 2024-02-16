@@ -142,7 +142,9 @@ impl BaseVulkanState {
         }
     }
 
-    pub fn create_swapchain(&self, window_width: u32, window_height: u32) -> MySwapchain {
+    pub fn create_swapchain(&mut self, window_width: u32, window_height: u32) -> MySwapchain {
+        self.swapchain_support = SwapchainSupportDetails::new(&self.physical_device, &self.surface);
+
         let bootstrap_swapchain = SwapchainBuilder::new(
             self.instance.clone(),
             self.device.clone(),

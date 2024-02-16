@@ -34,6 +34,9 @@ pub mod vk_imgui;
 const FRAME_OVERLAP: usize = 2;
 
 pub struct VulkanEngine {
+    pub draw_extent: vk::Extent2D,
+    pub render_scale: f32,
+    pub resize_requested: bool,
     current_background_effect: usize,
     frame_number: usize,
     meshes: Vec<MeshAsset>,
@@ -154,6 +157,9 @@ impl VulkanEngine {
             mesh_pipeline_layout,
             meshes,
             depth_image: depth_image_allocated,
+            resize_requested: false,
+            draw_extent: draw_image_extent,
+            render_scale: 1.,
         }
     }
 
@@ -244,6 +250,12 @@ impl VulkanEngine {
                     last_frame = now;
                 }
                 Event::WindowEvent {
+                    event: WindowEvent::Resized(_),
+                    ..
+                } => {
+                    self.resize_requested = true;
+                }
+                Event::WindowEvent {
                     event: WindowEvent::CloseRequested,
                     ..
                 } => {
@@ -260,6 +272,15 @@ impl VulkanEngine {
                     window_id: _,
                 } => {
                     let size = self.base.window.inner_size();
+
+                    if self.resize_requested {
+                        if size.width > 0 && size.height > 0 {
+                            //println!("resize requested!");
+                            self.resize_swapchain();
+                        } else {
+                            return;
+                        }
+                    }
                     platform
                         .prepare_frame(imgui.io_mut(), &self.base.window)
                         .expect("failed to prepare frame!");
@@ -268,6 +289,7 @@ impl VulkanEngine {
                     ui.window("background")
                         .size([500.0, 200.0], imgui::Condition::FirstUseEver)
                         .build(|| {
+                            ui.slider("Render Scale", 0.3, 1., &mut self.render_scale);
                             let len = self.background_effects.len();
                             let selected =
                                 &mut self.background_effects[self.current_background_effect];
@@ -326,16 +348,36 @@ impl VulkanEngine {
         unsafe { self.base.device.handle.reset_fences(&fences) }
             .expect("failed to reset render fence!");
 
+        let swapchain = &self.swapchain;
+
+        self.draw_extent.height = (swapchain.extent.height.min(self.draw_image.extent.height)
+            as f32
+            * self.render_scale) as u32;
+        self.draw_extent.width = (swapchain.extent.width.min(self.draw_image.extent.width) as f32
+            * self.render_scale) as u32;
+
         //acquire next swapchain image
         let (swapchain_image_index, _) = unsafe {
-            self.swapchain.swapchain_loader.acquire_next_image(
-                self.swapchain.swapchain,
+            let result = swapchain.swapchain_loader.acquire_next_image(
+                swapchain.swapchain,
                 u64::MAX,
                 current_frame.swapchain_semaphore,
                 vk::Fence::null(),
-            )
-        }
-        .expect("failed to get swapchain image!");
+            );
+
+            match result {
+                Ok((image_index, was_next_image_acquired)) => {
+                    (image_index, was_next_image_acquired)
+                }
+                Err(vk_result) => match vk_result {
+                    vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR => {
+                        self.resize_requested = true;
+                        return;
+                    }
+                    _ => panic!("failed to acquire next swapchain image!"),
+                },
+            }
+        };
 
         let cmd = current_frame.command_buffer;
 
@@ -356,7 +398,7 @@ impl VulkanEngine {
         }
         .expect("failed to begin command buffer!");
 
-        let swapchain_image = self.swapchain.swapchain_images[swapchain_image_index as usize];
+        let swapchain_image = swapchain.swapchain_images[swapchain_image_index as usize];
         self.base.transition_image_layout(
             cmd,
             self.draw_image.image,
@@ -399,8 +441,8 @@ impl VulkanEngine {
             cmd,
             self.draw_image.image,
             swapchain_image,
-            self.draw_image.extent,
-            self.swapchain.extent,
+            self.draw_extent,
+            swapchain.extent,
         );
 
         self.base.transition_image_layout(
@@ -414,7 +456,7 @@ impl VulkanEngine {
             cmd,
             draw_data,
             imgui_renderer,
-            self.swapchain.swapchain_image_views[swapchain_image_index as usize],
+            swapchain.swapchain_image_views[swapchain_image_index as usize],
         );
 
         self.base.transition_image_layout(
@@ -459,21 +501,43 @@ impl VulkanEngine {
         }
         .expect("queue command submit failed!");
 
-        let swapchains = [self.swapchain.swapchain];
+        let swapchains = [swapchain.swapchain];
         let render_semaphores = [current_frame.render_semaphore];
         let swapchain_image_indices = [swapchain_image_index];
         let present_info = vk::PresentInfoKHR::default()
             .swapchains(&swapchains)
             .wait_semaphores(&render_semaphores)
             .image_indices(&swapchain_image_indices);
-        unsafe {
-            self.swapchain
+
+        let present_result = unsafe {
+            swapchain
                 .swapchain_loader
                 .queue_present(self.base.graphics_queue, &present_info)
+        };
+        match present_result {
+            Ok(_) => (),
+            Err(vk_result) => match vk_result {
+                vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR => {
+                    self.resize_requested = true;
+                }
+                _ => panic!("failed to present swap chain image!"),
+            },
         }
-        .expect("failed to queue present to swapchain!");
 
         self.frame_number += 1;
+    }
+
+    fn resize_swapchain(&mut self) {
+        unsafe { self.base.device.handle.device_wait_idle() }
+            .expect("failed to wait for idle when recreating swapchain!");
+
+        let window_size = self.base.window.inner_size();
+        let window_height = window_size.height;
+        let window_width = window_size.width;
+
+        self.swapchain.destroy();
+        self.swapchain = self.base.create_swapchain(window_width, window_height);
+        self.resize_requested = false;
     }
 
     pub fn semaphore_submit_info(
@@ -544,15 +608,15 @@ impl VulkanEngine {
         unsafe {
             self.base.device.handle.cmd_dispatch(
                 cmd,
-                (self.draw_image.extent.width as f32 / 16.).ceil() as u32,
-                (self.draw_image.extent.height as f32 / 16.).ceil() as u32,
+                (self.draw_extent.width as f32 / 16.).ceil() as u32,
+                (self.draw_extent.height as f32 / 16.).ceil() as u32,
                 1,
             );
         }
     }
 
     pub fn draw_imgui(
-        &mut self,
+        &self,
         cmd: vk::CommandBuffer,
         draw_data: &imgui::DrawData,
         imgui_renderer: &mut imgui_rs_vulkan_renderer::Renderer,
@@ -661,7 +725,7 @@ impl VulkanEngine {
 
         let color_attachments = [color_attachment];
         let rendering_info = vk::RenderingInfo::default()
-            .render_area(self.draw_image.extent.into())
+            .render_area(self.draw_extent.into())
             .color_attachments(&color_attachments)
             .depth_attachment(&depth_attachment)
             .layer_count(1);
@@ -676,14 +740,14 @@ impl VulkanEngine {
         let viewport = vk::Viewport::default()
             .x(0.)
             .y(0.)
-            .width(self.draw_image.extent.width as f32)
-            .height(self.draw_image.extent.height as f32)
+            .width(self.draw_extent.width as f32)
+            .height(self.draw_extent.height as f32)
             .min_depth(0.)
             .max_depth(1.);
         let viewports = [viewport];
         unsafe { self.base.device.handle.cmd_set_viewport(cmd, 0, &viewports) };
 
-        let scissor = vk::Rect2D::default().extent(self.draw_image.extent);
+        let scissor = vk::Rect2D::default().extent(self.draw_extent);
         let scissors = [scissor];
         unsafe { self.base.device.handle.cmd_set_scissor(cmd, 0, &scissors) };
 
@@ -705,7 +769,7 @@ impl VulkanEngine {
         );
         let mut proj = glam::Mat4::perspective_rh_gl(
             70.,
-            self.draw_image.extent.width as f32 / self.draw_image.extent.height as f32,
+            self.draw_extent.width as f32 / self.draw_extent.height as f32,
             0.1,
             10000.,
         );

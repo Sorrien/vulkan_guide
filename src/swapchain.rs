@@ -12,6 +12,7 @@ pub struct MySwapchain {
     pub extent: vk::Extent2D,
     pub swapchain_images: Vec<vk::Image>,
     pub swapchain_image_views: Vec<vk::ImageView>,
+    is_valid: bool,
 }
 
 impl MySwapchain {
@@ -30,10 +31,9 @@ impl MySwapchain {
             queue_family_indices,
         )
     }
-}
 
-impl Drop for MySwapchain {
-    fn drop(&mut self) {
+    pub fn destroy(&mut self) {
+        self.is_valid = false;
         unsafe {
             self.swapchain_loader
                 .destroy_swapchain(self.swapchain, None)
@@ -46,6 +46,14 @@ impl Drop for MySwapchain {
                     .handle
                     .destroy_image_view(swapchain_image_view, None)
             };
+        }
+    }
+}
+
+impl Drop for MySwapchain {
+    fn drop(&mut self) {
+        if self.is_valid {
+            self.destroy();
         }
     }
 }
@@ -124,6 +132,7 @@ impl SwapchainBuilder {
             extent,
             swapchain_images,
             swapchain_image_views,
+            is_valid: true,
         }
     }
     fn create_swapchain(
@@ -167,7 +176,7 @@ impl SwapchainBuilder {
             (vk::SharingMode::EXCLUSIVE, vec![])
         };
 
-        let swapchain_loader = Swapchain::new(&self.instance.handle, & self.device.handle);
+        let swapchain_loader = Swapchain::new(&self.instance.handle, &self.device.handle);
         let swapchain_create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface.handle)
             .min_image_count(image_count)
