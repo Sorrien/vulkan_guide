@@ -1,6 +1,8 @@
 use std::{
+    ffi::c_void,
     mem::{size_of, ManuallyDrop},
-    sync::{Arc, Mutex},
+    ptr::{self, NonNull},
+    sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
 
@@ -8,7 +10,7 @@ use ash::vk;
 use ash_bootstrap::LogicalDevice;
 use base_vulkan::{BaseVulkanState, FrameData};
 use buffers::{copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, MeshAsset, Vertex};
-use descriptors::{Descriptor, DescriptorAllocator};
+use descriptors::{Descriptor, DescriptorAllocator, DescriptorLayout, DescriptorWriter};
 use gpu_allocator::{vulkan::*, MemoryLocation};
 use pipelines::Pipeline;
 use swapchain::MySwapchain;
@@ -34,11 +36,13 @@ pub mod vk_imgui;
 const FRAME_OVERLAP: usize = 2;
 
 pub struct VulkanEngine {
+    scene_data: GPUSceneData,
     pub draw_extent: vk::Extent2D,
     pub render_scale: f32,
     pub resize_requested: bool,
     current_background_effect: usize,
     frame_number: usize,
+    gpu_scene_data_descriptor_layout: DescriptorLayout,
     meshes: Vec<MeshAsset>,
     mesh_pipeline: Pipeline,
     mesh_pipeline_layout: Arc<PipelineLayout>,
@@ -49,7 +53,7 @@ pub struct VulkanEngine {
     global_descriptor_allocator: descriptors::DescriptorAllocator,
     draw_image: AllocatedImage,
     depth_image: AllocatedImage,
-    frames: Vec<Arc<FrameData>>,
+    frames: Vec<Arc<Mutex<FrameData>>>,
     pub swapchain: MySwapchain,
     base: BaseVulkanState,
 }
@@ -132,6 +136,8 @@ impl VulkanEngine {
         let draw_image_descriptor =
             base.init_descriptors(&mut global_descriptor_allocator, &draw_image_allocated);
 
+        let gpu_scene_data_descriptor_layout = base.init_gpu_scene_descriptor_layout();
+
         let (background_effects, background_effect_pipeline_layout) =
             base.init_pipelines(draw_image_descriptor.layout);
 
@@ -160,6 +166,8 @@ impl VulkanEngine {
             resize_requested: false,
             draw_extent: draw_image_extent,
             render_scale: 1.,
+            gpu_scene_data_descriptor_layout,
+            scene_data: GPUSceneData::default(),
         }
     }
 
@@ -167,17 +175,6 @@ impl VulkanEngine {
         if let Some(mut meshes) = loader::load_gltf_meshes(self, "assets/basicmesh.glb") {
             self.meshes.append(&mut meshes);
         }
-        /*
-        let vertices = vec![
-            Vertex::new(glam::vec3(-0.5, -0.5, 0.), glam::vec4(1., 0., 0., 1.)),
-            Vertex::new(glam::vec3(0.5, -0.5, 0.), glam::vec4(0.0, 1.0, 0.0, 1.)),
-            Vertex::new(glam::vec3(0.5, 0.5, 0.), glam::vec4(0., 0., 1., 1.)),
-            Vertex::new(glam::vec3(-0.5, 0.5, 0.), glam::vec4(1.0, 1.0, 1.0, 1.)),
-        ];
-        let indices = vec![0, 1, 2, 2, 3, 0];
-        let rectangle = self.upload_mesh(indices, vertices);
-        self.meshes.push(rectangle);
-         */
     }
 
     pub fn init_imgui(
@@ -216,7 +213,7 @@ impl VulkanEngine {
         (event_loop, window)
     }
 
-    pub fn get_current_frame(&self) -> Arc<FrameData> {
+    pub fn get_current_frame(&self) -> Arc<Mutex<FrameData>> {
         self.frames[self.frame_number % FRAME_OVERLAP].clone()
     }
 
@@ -337,6 +334,7 @@ impl VulkanEngine {
         imgui_renderer: &mut imgui_rs_vulkan_renderer::Renderer,
     ) {
         let current_frame = self.get_current_frame();
+        let mut current_frame = current_frame.lock().unwrap();
         let fences = [current_frame.render_fence];
         unsafe {
             self.base
@@ -347,6 +345,9 @@ impl VulkanEngine {
         .expect("failed to wait for render fence!");
         unsafe { self.base.device.handle.reset_fences(&fences) }
             .expect("failed to reset render fence!");
+
+        current_frame.frame_descriptors.destroy_pools();
+        current_frame.frame_descriptors.clear_pools();
 
         let swapchain = &self.swapchain;
 
@@ -421,7 +422,7 @@ impl VulkanEngine {
             vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
         );
 
-        self.draw_geometry(cmd);
+        self.draw_geometry(cmd, &mut current_frame);
 
         self.base.transition_image_layout(
             cmd,
@@ -710,7 +711,29 @@ impl VulkanEngine {
             .expect("failed to wait for imm submit fence!");
     }
 
-    fn draw_geometry(&self, cmd: vk::CommandBuffer) {
+    fn draw_geometry(&self, cmd: vk::CommandBuffer, frame: &mut MutexGuard<'_, FrameData>) {
+        let ptr = frame
+            .gpu_scene_data_buffer
+            .allocation
+            .mapped_ptr()
+            .unwrap()
+            .as_ptr();
+        let scene_data_ptr = &self.scene_data as *const _ as *const c_void;
+        unsafe { ptr::write(ptr, ptr::read(scene_data_ptr)) };
+
+        let global_descriptor = frame
+            .frame_descriptors
+            .allocate(self.gpu_scene_data_descriptor_layout.handle);
+        let mut descriptor_writer = DescriptorWriter::new();
+        descriptor_writer.write_buffer(
+            0,
+            frame.gpu_scene_data_buffer.buffer,
+            size_of::<GPUSceneData>() as u64,
+            0,
+            descriptors::BufferDescriptorType::UniformBuffer,
+        );
+        descriptor_writer.update_set(self.base.device.clone(), global_descriptor);
+
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.draw_image.image_view)
             .image_layout(vk::ImageLayout::GENERAL);
@@ -996,4 +1019,15 @@ pub struct ComputeEffect {
     pub name: String,
     pub pipeline: Pipeline,
     pub data: ComputePushConstants,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct GPUSceneData {
+    view: glam::Mat4,
+    proj: glam::Mat4,
+    view_prof: glam::Mat4,
+    ambient_color: glam::Vec4,
+    sunlight_direction: glam::Vec4,
+    sunlight_color: glam::Vec4,
 }

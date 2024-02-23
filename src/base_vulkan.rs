@@ -27,9 +27,12 @@ use crate::{
         copy_to_staging_buffer, AllocatedBuffer, GPUDrawPushConstants, GPUMeshBuffers, Vertex,
     },
     debug,
-    descriptors::{Descriptor, DescriptorAllocator, DescriptorLayoutBuilder, PoolSizeRatio},
+    descriptors::{
+        Descriptor, DescriptorAllocator, DescriptorAllocatorGrowable, DescriptorLayout,
+        DescriptorLayoutBuilder, DescriptorWriter, PoolSizeRatio,
+    },
     pipelines::{Pipeline, PipelineBuilder, PipelineLayout},
-    swapchain, AllocatedImage, ComputeEffect, ComputePushConstants,
+    swapchain, AllocatedImage, ComputeEffect, ComputePushConstants, GPUSceneData,
 };
 
 pub struct BaseVulkanState {
@@ -188,9 +191,9 @@ impl BaseVulkanState {
         unsafe { self.device.handle.allocate_command_buffers(&alloc_info) }
     }
 
-    pub fn create_frame_data(&self, count: usize) -> Vec<Arc<FrameData>> {
+    pub fn create_frame_data(&self, count: usize) -> Vec<Arc<Mutex<FrameData>>> {
         (0..count)
-            .map(|_| {
+            .map(|i| {
                 let command_pool = self
                     .create_command_pool(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
                     .expect("failed to create command pool!");
@@ -207,6 +210,23 @@ impl BaseVulkanState {
                 let render_semaphore = self
                     .create_semaphore(vk::SemaphoreCreateFlags::empty())
                     .expect("failed to create swapchain semaphore!");
+
+                let frame_sizes = vec![
+                    PoolSizeRatio::new(vk::DescriptorType::STORAGE_IMAGE, 3.),
+                    PoolSizeRatio::new(vk::DescriptorType::STORAGE_BUFFER, 3.),
+                    PoolSizeRatio::new(vk::DescriptorType::UNIFORM_BUFFER, 3.),
+                    PoolSizeRatio::new(vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 4.),
+                ];
+                let mut frame_descriptors = DescriptorAllocatorGrowable::new(self.device.clone());
+                frame_descriptors.init(1000, frame_sizes);
+
+                let gpu_scene_data_buffer = self.create_buffer(
+                    &format!("gpuscendata buffer {}", i),
+                    size_of::<GPUSceneData>(),
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                );
+
                 FrameData::new(
                     self.device.clone(),
                     command_pool,
@@ -214,6 +234,8 @@ impl BaseVulkanState {
                     render_fence,
                     swapchain_semaphore,
                     render_semaphore,
+                    frame_descriptors,
+                    gpu_scene_data_buffer,
                 )
             })
             .collect::<Vec<_>>()
@@ -493,6 +515,18 @@ impl BaseVulkanState {
             .allocate(vec![draw_image_descriptor_layout])
             .unwrap()[0];
 
+        let mut desc_writer = DescriptorWriter::new();
+
+        desc_writer.write_image(
+            0,
+            draw_image.image_view,
+            vk::Sampler::null(),
+            vk::ImageLayout::GENERAL,
+            vk::DescriptorType::STORAGE_IMAGE,
+        );
+
+        desc_writer.update_set(self.device.clone(), draw_image_descriptors);
+
         let image_info = vk::DescriptorImageInfo::default()
             .image_layout(vk::ImageLayout::GENERAL)
             .image_view(draw_image.image_view);
@@ -518,6 +552,18 @@ impl BaseVulkanState {
             draw_image_descriptors,
             draw_image_descriptor_layout,
         )
+    }
+
+    pub fn init_gpu_scene_descriptor_layout(&self) -> DescriptorLayout {
+        let layout = DescriptorLayoutBuilder::new()
+            .add_binding(0, vk::DescriptorType::UNIFORM_BUFFER)
+            .build(
+                self.device.clone(),
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            )
+            .expect("failed to build gpu scene desc layout!");
+
+        DescriptorLayout::new(self.device.clone(), layout)
     }
 
     pub fn init_immediate_command(&self) -> ImmediateCommand {
@@ -620,7 +666,7 @@ pub fn find_memory_type(
     panic!("failed to find suitable memory type!");
 }
 
-#[derive(Clone)]
+//#[derive(Clone)]
 pub struct FrameData {
     device: Arc<LogicalDevice>,
     pub command_pool: vk::CommandPool,
@@ -628,6 +674,8 @@ pub struct FrameData {
     pub render_fence: vk::Fence,
     pub swapchain_semaphore: vk::Semaphore,
     pub render_semaphore: vk::Semaphore,
+    pub frame_descriptors: DescriptorAllocatorGrowable,
+    pub gpu_scene_data_buffer: AllocatedBuffer,
 }
 
 impl FrameData {
@@ -638,15 +686,19 @@ impl FrameData {
         render_fence: vk::Fence,
         swapchain_semaphore: vk::Semaphore,
         render_semaphore: vk::Semaphore,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+        frame_descriptors: DescriptorAllocatorGrowable,
+        gpu_scene_data_buffer: AllocatedBuffer,
+    ) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
             device,
             command_pool,
             command_buffer,
             render_fence,
             swapchain_semaphore,
             render_semaphore,
-        })
+            frame_descriptors,
+            gpu_scene_data_buffer,
+        }))
     }
 }
 
