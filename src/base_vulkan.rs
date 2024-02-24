@@ -1,7 +1,7 @@
 use std::{
     ffi::{CStr, CString},
     fs::File,
-    mem::size_of,
+    mem::{size_of, ManuallyDrop},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -296,7 +296,7 @@ impl BaseVulkanState {
 
     pub fn create_image(
         &mut self,
-        img_extent: vk::Extent2D,
+        img_extent: vk::Extent3D,
         format: vk::Format,
         tiling: vk::ImageTiling,
         usage: vk::ImageUsageFlags,
@@ -374,6 +374,51 @@ impl BaseVulkanState {
         }
         .expect("failed to create image view!");
         image_view
+    }
+
+    pub fn create_allocated_image(
+        &mut self,
+        extent: vk::Extent3D,
+        format: vk::Format,
+        tiling: vk::ImageTiling,
+        usage: vk::ImageUsageFlags,
+        memory_location: gpu_allocator::MemoryLocation,
+        mip_levels: u32,
+        num_samples: vk::SampleCountFlags,
+    ) -> AllocatedImage {
+        let (image, allocation) = self.create_image(
+            extent,
+            format,
+            tiling,
+            usage,
+            memory_location,
+            mip_levels,
+            num_samples,
+        );
+
+        let depth_formats = vec![
+            vk::Format::D32_SFLOAT,
+            vk::Format::D32_SFLOAT_S8_UINT,
+            vk::Format::D24_UNORM_S8_UINT,
+        ];
+
+        let aspect_mask = if depth_formats.contains(&format) {
+            vk::ImageAspectFlags::DEPTH
+        } else {
+            vk::ImageAspectFlags::COLOR
+        };
+
+        let image_view = self.create_image_view(image, format, aspect_mask, mip_levels);
+
+        AllocatedImage {
+            device: self.device.clone(),
+            allocator: self.allocator.clone(),
+            image,
+            image_view,
+            allocation: ManuallyDrop::new(allocation),
+            extent,
+            format,
+        }
     }
 
     pub fn create_shader_module<P>(&self, path: P) -> vk::ShaderModule
@@ -566,6 +611,15 @@ impl BaseVulkanState {
         DescriptorLayout::new(self.device.clone(), layout)
     }
 
+    pub fn init_single_image_layout(&self) -> DescriptorLayout {
+        let layout = DescriptorLayoutBuilder::new()
+            .add_binding(0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .build(self.device.clone(), vk::ShaderStageFlags::FRAGMENT)
+            .expect("failed to build gpu scene desc layout!");
+
+        DescriptorLayout::new(self.device.clone(), layout)
+    }
+
     pub fn init_immediate_command(&self) -> ImmediateCommand {
         let command_pool = self
             .create_command_pool(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -586,10 +640,11 @@ impl BaseVulkanState {
         &self,
         draw_image_format: vk::Format,
         depth_image_format: vk::Format,
+        single_image_descriptor_layout: &DescriptorLayout,
     ) -> (Pipeline, Arc<PipelineLayout>) {
         let triangle_vert_shader =
             self.create_shader_module("shaders/colored_triangle_mesh.vert.spv");
-        let triangle_frag_shader = self.create_shader_module("shaders/colored_triangle.frag.spv");
+        let triangle_frag_shader = self.create_shader_module("shaders/text_image.frag.spv");
 
         let buffer_range = vk::PushConstantRange::default()
             .offset(0)
@@ -597,8 +652,10 @@ impl BaseVulkanState {
             .stage_flags(vk::ShaderStageFlags::VERTEX);
 
         let push_constants_ranges = [buffer_range];
-        let pipeline_layout_info =
-            vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&push_constants_ranges);
+        let set_layouts = [single_image_descriptor_layout.handle];
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .push_constant_ranges(&push_constants_ranges)
+            .set_layouts(&set_layouts);
 
         let pipeline_layout = PipelineLayout::new(self.device.clone(), pipeline_layout_info)
             .expect("failed to create triangle pipeline layout!");
@@ -609,7 +666,8 @@ impl BaseVulkanState {
             .set_polygon_mode(vk::PolygonMode::FILL)
             .set_cull_mode(vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
             .set_multisampling_none()
-            .enable_blending_additive()
+            .disable_blending()
+            //.enable_blending_additive()
             .enable_depth_test(true, vk::CompareOp::GREATER_OR_EQUAL)
             .set_color_attachment_format(draw_image_format)
             .set_depth_attachment_format(depth_image_format)

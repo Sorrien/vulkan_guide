@@ -78,12 +78,45 @@ impl Drop for AllocatedBuffer {
 pub fn copy_to_staging_buffer<DataType: std::marker::Copy>(
     staging_buffer: &AllocatedBuffer,
     size: vk::DeviceSize,
-    data: &Vec<DataType>,
+    data: &[DataType],
 ) {
     let ptr = unsafe { staging_buffer.allocation.mapped_ptr().unwrap().as_mut() };
     let mut align =
         unsafe { Align::new(ptr, std::mem::align_of::<DataType>() as u64, size as u64) };
     align.copy_from_slice(&data);
+}
+
+pub fn copy_buffer_to_image(
+    command_buffer: vk::CommandBuffer,
+    device: Arc<LogicalDevice>,
+    buffer: vk::Buffer,
+    image: vk::Image,
+    image_extent: vk::Extent3D,
+) {
+    let buffer_image_copy = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(0)
+        .buffer_image_height(0)
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_offset(vk::Offset3D::default())
+        .image_extent(image_extent.into());
+
+    let regions = [buffer_image_copy];
+    unsafe {
+        device.handle.cmd_copy_buffer_to_image(
+            command_buffer,
+            buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        )
+    }
 }
 
 //#[repr(C)] keeps our Vertex in the correct format for our shaders.

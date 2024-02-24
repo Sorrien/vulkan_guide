@@ -86,7 +86,7 @@ where
                     {
                         tex_coord_attribute.enumerate().for_each(|(i, tex_coord)| {
                             primitive_vertices[i].uv_x = tex_coord[0];
-                            primitive_vertices[i].uv_x = tex_coord[1];
+                            primitive_vertices[i].uv_y = tex_coord[1];
                         });
                     }
 

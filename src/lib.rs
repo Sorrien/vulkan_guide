@@ -1,4 +1,5 @@
 use std::{
+    array,
     ffi::c_void,
     mem::{size_of, ManuallyDrop},
     ptr::{self, NonNull},
@@ -9,9 +10,13 @@ use std::{
 use ash::vk;
 use ash_bootstrap::LogicalDevice;
 use base_vulkan::{BaseVulkanState, FrameData};
-use buffers::{copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, MeshAsset, Vertex};
+use buffers::{
+    copy_buffer_to_image, copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, MeshAsset,
+    Vertex,
+};
 use descriptors::{Descriptor, DescriptorAllocator, DescriptorLayout, DescriptorWriter};
 use gpu_allocator::{vulkan::*, MemoryLocation};
+use image::RgbaImage;
 use pipelines::Pipeline;
 use swapchain::MySwapchain;
 use vk_imgui::init_imgui;
@@ -36,6 +41,12 @@ pub mod vk_imgui;
 const FRAME_OVERLAP: usize = 2;
 
 pub struct VulkanEngine {
+    default_sampler_linear: Sampler,
+    default_sampler_nearest: Sampler,
+    white_image: Option<AllocatedImage>,
+    grey_image: Option<AllocatedImage>,
+    black_image: Option<AllocatedImage>,
+    error_checkerboard_image: Option<AllocatedImage>,
     scene_data: GPUSceneData,
     pub draw_extent: vk::Extent2D,
     pub render_scale: f32,
@@ -46,6 +57,7 @@ pub struct VulkanEngine {
     meshes: Vec<MeshAsset>,
     mesh_pipeline: Pipeline,
     mesh_pipeline_layout: Arc<PipelineLayout>,
+    single_image_descriptor_layout: DescriptorLayout,
     immediate_command: base_vulkan::ImmediateCommand,
     background_effects: Vec<ComputeEffect>,
     background_effect_pipeline_layout: Arc<PipelineLayout>,
@@ -72,10 +84,9 @@ impl VulkanEngine {
             width: window_width,
             height: window_height,
         };
-        let draw_image_format = vk::Format::R16G16B16A16_SFLOAT;
-        let (draw_image, draw_image_allocation) = base.create_image(
-            draw_image_extent,
-            draw_image_format,
+        let draw_image_allocated = base.create_allocated_image(
+            draw_image_extent.into(),
+            vk::Format::R16G16B16A16_SFLOAT,
             vk::ImageTiling::OPTIMAL,
             vk::ImageUsageFlags::TRANSFER_SRC
                 | vk::ImageUsageFlags::TRANSFER_DST
@@ -86,26 +97,10 @@ impl VulkanEngine {
             vk::SampleCountFlags::TYPE_1,
         );
 
-        let draw_image_view = base.create_image_view(
-            draw_image,
-            draw_image_format,
-            vk::ImageAspectFlags::COLOR,
-            1,
-        );
-
-        let draw_image_allocated = AllocatedImage {
-            image: draw_image,
-            image_view: draw_image_view,
-            extent: draw_image_extent.into(),
-            format: draw_image_format,
-            allocation: ManuallyDrop::new(draw_image_allocation),
-            device: base.device.clone(),
-            allocator: base.allocator.clone(),
-        };
-
         let depth_image_format = vk::Format::D32_SFLOAT;
-        let (depth_image, depth_image_allocation) = base.create_image(
-            draw_image_extent,
+
+        let depth_image_allocated = base.create_allocated_image(
+            draw_image_extent.into(),
             depth_image_format,
             vk::ImageTiling::OPTIMAL,
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
@@ -114,23 +109,6 @@ impl VulkanEngine {
             vk::SampleCountFlags::TYPE_1,
         );
 
-        let depth_image_view = base.create_image_view(
-            depth_image,
-            depth_image_format,
-            vk::ImageAspectFlags::DEPTH,
-            1,
-        );
-
-        let depth_image_allocated = AllocatedImage {
-            image: depth_image,
-            image_view: depth_image_view,
-            extent: draw_image_extent.into(),
-            format: depth_image_format,
-            allocation: ManuallyDrop::new(depth_image_allocation),
-            device: base.device.clone(),
-            allocator: base.allocator.clone(),
-        };
-
         let mut global_descriptor_allocator = DescriptorAllocator::new(base.device.clone());
 
         let draw_image_descriptor =
@@ -138,14 +116,22 @@ impl VulkanEngine {
 
         let gpu_scene_data_descriptor_layout = base.init_gpu_scene_descriptor_layout();
 
+        let single_image_descriptor_layout = base.init_single_image_layout();
+
         let (background_effects, background_effect_pipeline_layout) =
             base.init_pipelines(draw_image_descriptor.layout);
 
-        let (mesh_pipeline, mesh_pipeline_layout) =
-            base.init_mesh_pipeline(draw_image_allocated.format, depth_image_allocated.format);
+        let (mesh_pipeline, mesh_pipeline_layout) = base.init_mesh_pipeline(
+            draw_image_allocated.format,
+            depth_image_allocated.format,
+            &single_image_descriptor_layout,
+        );
 
         let immediate_command = base.init_immediate_command();
         let meshes = vec![];
+
+        let default_sampler_linear = Sampler::new(vk::Sampler::null(), base.device.clone());
+        let default_sampler_nearest = Sampler::new(vk::Sampler::null(), base.device.clone());
 
         Self {
             base,
@@ -168,6 +154,13 @@ impl VulkanEngine {
             render_scale: 1.,
             gpu_scene_data_descriptor_layout,
             scene_data: GPUSceneData::default(),
+            white_image: None,
+            grey_image: None,
+            black_image: None,
+            error_checkerboard_image: None,
+            default_sampler_linear,
+            default_sampler_nearest,
+            single_image_descriptor_layout,
         }
     }
 
@@ -175,6 +168,99 @@ impl VulkanEngine {
         if let Some(mut meshes) = loader::load_gltf_meshes(self, "assets/basicmesh.glb") {
             self.meshes.append(&mut meshes);
         }
+
+        let white: [u8; 4] = [255, 255, 255, 255];
+        self.white_image = Some(self.create_allocated_texture_image(
+            &[white],
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::SAMPLED,
+            MemoryLocation::GpuOnly,
+            1,
+            vk::SampleCountFlags::TYPE_1,
+        ));
+
+        let grey: [u8; 4] = [128, 128, 128, 255];
+        self.grey_image = Some(self.create_allocated_texture_image(
+            &[grey],
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::SAMPLED,
+            MemoryLocation::GpuOnly,
+            1,
+            vk::SampleCountFlags::TYPE_1,
+        ));
+
+        let black: [u8; 4] = [0, 0, 0, 255];
+        self.black_image = Some(self.create_allocated_texture_image(
+            &[black],
+            vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::SAMPLED,
+            MemoryLocation::GpuOnly,
+            1,
+            vk::SampleCountFlags::TYPE_1,
+        ));
+
+        let mut my_image = RgbaImage::new(16, 16);
+        let magenta = [255, 0, 255, 255];
+        for (x, y, pixel) in my_image.enumerate_pixels_mut() {
+            pixel.0 = if (x + y) % 2 == 0 { magenta } else { black }
+        }
+
+        self.error_checkerboard_image = Some(self.create_allocated_texture_image(
+            &my_image.into_raw(),
+            vk::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::SAMPLED,
+            MemoryLocation::GpuOnly,
+            1,
+            vk::SampleCountFlags::TYPE_1,
+        ));
+
+        let nearest_sampler_create_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::NEAREST)
+            .min_filter(vk::Filter::NEAREST);
+
+        self.default_sampler_nearest.handle = unsafe {
+            self.base
+                .device
+                .handle
+                .create_sampler(&nearest_sampler_create_info, None)
+        }
+        .expect("failed to create nearest default sampler!");
+
+        let linear_sampler_create_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR);
+
+        self.default_sampler_linear.handle = unsafe {
+            self.base
+                .device
+                .handle
+                .create_sampler(&linear_sampler_create_info, None)
+        }
+        .expect("failed to create nearest linear sampler!");
     }
 
     pub fn init_imgui(
@@ -442,8 +528,8 @@ impl VulkanEngine {
             cmd,
             self.draw_image.image,
             swapchain_image,
-            self.draw_extent,
-            swapchain.extent,
+            self.draw_extent.into(),
+            swapchain.extent.into(),
         );
 
         self.base.transition_image_layout(
@@ -724,15 +810,17 @@ impl VulkanEngine {
         let global_descriptor = frame
             .frame_descriptors
             .allocate(self.gpu_scene_data_descriptor_layout.handle);
-        let mut descriptor_writer = DescriptorWriter::new();
-        descriptor_writer.write_buffer(
-            0,
-            frame.gpu_scene_data_buffer.buffer,
-            size_of::<GPUSceneData>() as u64,
-            0,
-            descriptors::BufferDescriptorType::UniformBuffer,
-        );
-        descriptor_writer.update_set(self.base.device.clone(), global_descriptor);
+        {
+            let mut descriptor_writer = DescriptorWriter::new();
+            descriptor_writer.write_buffer(
+                0,
+                frame.gpu_scene_data_buffer.buffer,
+                size_of::<GPUSceneData>() as u64,
+                0,
+                descriptors::BufferDescriptorType::UniformBuffer,
+            );
+            descriptor_writer.update_set(self.base.device.clone(), global_descriptor);
+        }
 
         let color_attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.draw_image.image_view)
@@ -782,8 +870,41 @@ impl VulkanEngine {
             )
         };
 
+        if let Some(image) = &self.error_checkerboard_image {
+            let image_set = frame
+                .frame_descriptors
+                .allocate(self.single_image_descriptor_layout.handle);
+            {
+                let mut descriptor_writer = DescriptorWriter::new();
+                descriptor_writer.write_image(
+                    0,
+                    image.image_view,
+                    self.default_sampler_nearest.handle,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                );
+
+                descriptor_writer.update_set(self.base.device.clone(), image_set);
+            }
+
+            let mesh_pipeline_desc_sets = [image_set];
+
+            unsafe {
+                self.base.device.handle.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.mesh_pipeline_layout.handle,
+                    0,
+                    &mesh_pipeline_desc_sets,
+                    &[],
+                )
+            };
+        }
+
         //for mesh in &self.meshes {
         let mesh = &self.meshes[2];
+
+        let model = glam::Mat4::IDENTITY * glam::Mat4::from_axis_angle(glam::Vec3::Z, 0.);
 
         let view = glam::Mat4::look_at_rh(
             glam::Vec3::new(0., 0., -5.),
@@ -799,7 +920,7 @@ impl VulkanEngine {
         proj.y_axis *= -1.;
 
         let draw_push_constants =
-            GPUDrawPushConstants::new(proj * view, mesh.mesh_buffers.vertex_buffer_address);
+            GPUDrawPushConstants::new(proj * view * model, mesh.mesh_buffers.vertex_buffer_address);
 
         let pc = [draw_push_constants];
         unsafe {
@@ -916,6 +1037,67 @@ impl VulkanEngine {
 
         new_surface
     }
+
+    pub fn create_allocated_texture_image<T>(
+        &mut self,
+        data: &[T],
+        extent: vk::Extent3D,
+        format: vk::Format,
+        tiling: vk::ImageTiling,
+        usage: vk::ImageUsageFlags,
+        memory_location: gpu_allocator::MemoryLocation,
+        mip_levels: u32,
+        num_samples: vk::SampleCountFlags,
+    ) -> AllocatedImage
+    where
+        T: Copy,
+    {
+        let data_size = size_of::<T>() * data.len(); //extent.depth * extent.width * extent.height;
+        let upload_buffer = self.base.create_buffer(
+            "texture upload buffer",
+            data_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+        );
+
+        copy_to_staging_buffer(&upload_buffer, data_size as u64, &data);
+
+        let allocated_image = self.base.create_allocated_image(
+            extent,
+            format,
+            tiling,
+            usage | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC,
+            memory_location,
+            mip_levels,
+            num_samples,
+        );
+
+        self.immediate_submit(|cmd| {
+            self.base.transition_image_layout(
+                cmd,
+                allocated_image.image,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            );
+
+            copy_buffer_to_image(
+                cmd,
+                self.base.device.clone(),
+                upload_buffer.buffer,
+                allocated_image.image,
+                extent,
+            );
+
+            self.base.transition_image_layout(
+                cmd,
+                allocated_image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
+        });
+
+        allocated_image
+    }
 }
 
 impl Drop for VulkanEngine {
@@ -925,13 +1107,30 @@ impl Drop for VulkanEngine {
     }
 }
 
+pub struct Sampler {
+    device: Arc<LogicalDevice>,
+    pub handle: vk::Sampler,
+}
+
+impl Sampler {
+    fn new(handle: vk::Sampler, device: Arc<LogicalDevice>) -> Self {
+        Self { handle, device }
+    }
+}
+
+impl Drop for Sampler {
+    fn drop(&mut self) {
+        unsafe { self.device.handle.destroy_sampler(self.handle, None) };
+    }
+}
+
 pub struct AllocatedImage {
     device: Arc<LogicalDevice>,
     allocator: Arc<Mutex<Allocator>>,
     image: vk::Image,
     image_view: vk::ImageView,
     allocation: ManuallyDrop<Allocation>,
-    extent: vk::Extent2D,
+    extent: vk::Extent3D,
     format: vk::Format,
 }
 
@@ -955,8 +1154,8 @@ pub fn copy_image_to_image(
     cmd: vk::CommandBuffer,
     src: vk::Image,
     dst: vk::Image,
-    src_size: vk::Extent2D,
-    dst_size: vk::Extent2D,
+    src_size: vk::Extent3D,
+    dst_size: vk::Extent3D,
 ) {
     let blit_region = vk::ImageBlit2::default()
         .src_offsets([
@@ -964,7 +1163,7 @@ pub fn copy_image_to_image(
             vk::Offset3D {
                 x: src_size.width as i32,
                 y: src_size.height as i32,
-                z: 1,
+                z: src_size.depth as i32,
             },
         ])
         .dst_offsets([
@@ -972,7 +1171,7 @@ pub fn copy_image_to_image(
             vk::Offset3D {
                 x: dst_size.width as i32,
                 y: dst_size.height as i32,
-                z: 1,
+                z: dst_size.depth as i32,
             },
         ])
         .src_subresource(
