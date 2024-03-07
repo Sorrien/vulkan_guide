@@ -5,9 +5,8 @@ use ash::vk;
 use crate::ash_bootstrap::LogicalDevice;
 
 pub struct Descriptor {
-    device: Arc<LogicalDevice>,
     pub set: vk::DescriptorSet,
-    pub layout: vk::DescriptorSetLayout,
+    pub layout: DescriptorLayout,
 }
 
 impl Descriptor {
@@ -17,20 +16,9 @@ impl Descriptor {
         layout: vk::DescriptorSetLayout,
     ) -> Self {
         Self {
-            device,
             set,
-            layout,
+            layout: DescriptorLayout::new(device, layout),
         }
-    }
-}
-
-impl Drop for Descriptor {
-    fn drop(&mut self) {
-        unsafe {
-            self.device
-                .handle
-                .destroy_descriptor_set_layout(self.layout, None)
-        };
     }
 }
 

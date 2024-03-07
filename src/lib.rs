@@ -14,10 +14,14 @@ use buffers::{
     copy_buffer_to_image, copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, MeshAsset,
     Vertex,
 };
-use descriptors::{Descriptor, DescriptorAllocator, DescriptorLayout, DescriptorWriter};
+use descriptors::{
+    Descriptor, DescriptorAllocator, DescriptorAllocatorGrowable, DescriptorLayout,
+    DescriptorLayoutBuilder, DescriptorWriter,
+};
+use gltf::Material;
 use gpu_allocator::{vulkan::*, MemoryLocation};
 use image::RgbaImage;
-use pipelines::Pipeline;
+use pipelines::{Pipeline, PipelineBuilder};
 use swapchain::MySwapchain;
 use vk_imgui::init_imgui;
 use winit::{
@@ -119,7 +123,7 @@ impl VulkanEngine {
         let single_image_descriptor_layout = base.init_single_image_layout();
 
         let (background_effects, background_effect_pipeline_layout) =
-            base.init_pipelines(draw_image_descriptor.layout);
+            base.init_pipelines(draw_image_descriptor.layout.handle);
 
         let (mesh_pipeline, mesh_pipeline_layout) = base.init_mesh_pipeline(
             draw_image_allocated.format,
@@ -904,7 +908,7 @@ impl VulkanEngine {
         //for mesh in &self.meshes {
         let mesh = &self.meshes[2];
 
-        let model = glam::Mat4::IDENTITY * glam::Mat4::from_axis_angle(glam::Vec3::Z, 0.);
+        let model = glam::Mat4::IDENTITY * glam::Mat4::from_axis_angle(glam::Vec3::Y, 0.);
 
         let view = glam::Mat4::look_at_rh(
             glam::Vec3::new(0., 0., -5.),
@@ -1229,4 +1233,191 @@ pub struct GPUSceneData {
     ambient_color: glam::Vec4,
     sunlight_direction: glam::Vec4,
     sunlight_color: glam::Vec4,
+}
+
+pub struct RenderObject {
+    index_count: u32,
+    first_index: u32,
+    index_buffer: vk::Buffer,
+
+    material: Arc<MaterialInstance>,
+    transform: glam::Mat4,
+    vertex_buffer_address: vk::DeviceAddress,
+}
+
+pub struct MaterialInstance<'a> {
+    pipeline: &'a Pipeline,
+    material_set: vk::DescriptorSet,
+    pass_type: MaterialPass,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+pub enum MaterialPass {
+    MainColor = 1,
+    Transparent = 2,
+    Other = 3,
+}
+
+pub struct GLTFMetallicRoughness {
+    opaque_pipeline: Pipeline,
+    transparent_pipeline: Pipeline,
+
+    material_layout: DescriptorLayout,
+}
+
+impl GLTFMetallicRoughness {
+    pub fn new(engine: &VulkanEngine) -> Self {
+        let material_layout = DescriptorLayoutBuilder::new()
+            .add_binding(0, vk::DescriptorType::UNIFORM_BUFFER)
+            .add_binding(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .add_binding(2, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .build(
+                engine.base.device.clone(),
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            )
+            .expect("failed to create material set layout");
+
+        let (opaque_pipeline, transparent_pipeline) =
+            Self::build_pipelines(engine, material_layout);
+
+        Self {
+            opaque_pipeline,
+            transparent_pipeline,
+            material_layout: DescriptorLayout::new(engine.base.device.clone(), material_layout),
+        }
+    }
+
+    pub fn build_pipelines(
+        engine: &VulkanEngine,
+        material_layout: vk::DescriptorSetLayout,
+    ) -> (Pipeline, Pipeline) {
+        let mesh_frag_shader = engine.base.create_shader_module("/shaders/mesh.frag.spv");
+        let mesh_vert_shader = engine.base.create_shader_module("/shaders/mesh.vert.spv");
+
+        let matrix_range = vk::PushConstantRange::default()
+            .offset(0)
+            .size(size_of::<GPUDrawPushConstants>() as u32)
+            .stage_flags(vk::ShaderStageFlags::VERTEX);
+
+        let layouts = [
+            engine.gpu_scene_data_descriptor_layout.handle,
+            material_layout,
+        ];
+
+        let push_constant_ranges = [matrix_range];
+        let mesh_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .push_constant_ranges(&push_constant_ranges)
+            .set_layouts(&layouts);
+
+        let new_layout = PipelineLayout::new(engine.base.device.clone(), mesh_layout_info)
+            .expect("failed to create pipeline layout!");
+
+        let pipeline_builder = PipelineBuilder::new(new_layout)
+            .set_shaders(mesh_vert_shader, mesh_frag_shader)
+            .set_input_topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .set_cull_mode(vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
+            .set_multisampling_none()
+            .set_color_attachment_format(engine.draw_image.format)
+            .set_depth_attachment_format(engine.depth_image.format);
+
+        let pipeline_builder_transparent = pipeline_builder
+            .clone()
+            .enable_blending_additive()
+            .enable_depth_test(false, vk::CompareOp::GREATER_OR_EQUAL);
+
+        let pipeline_builder_opaque = pipeline_builder
+            .disable_blending()
+            .enable_depth_test(true, vk::CompareOp::GREATER_OR_EQUAL);
+
+        let opaque_pipeline = pipeline_builder_opaque
+            .build_pipeline(engine.base.device.clone())
+            .expect("failed to build opaque pipeline!");
+
+        let transparent_pipeline = pipeline_builder_transparent
+            .build_pipeline(engine.base.device.clone())
+            .expect("failed to build transparent pipeline!");
+
+        unsafe {
+            engine
+                .base
+                .device
+                .handle
+                .destroy_shader_module(mesh_vert_shader, None);
+            engine
+                .base
+                .device
+                .handle
+                .destroy_shader_module(mesh_frag_shader, None);
+        }
+
+        (opaque_pipeline, transparent_pipeline)
+    }
+
+    pub fn clear_resources() {}
+
+    pub fn write_material(
+        &self,
+        device: Arc<LogicalDevice>,
+        pass: MaterialPass,
+        resources: &MaterialResources,
+        descriptor_allocator: &mut DescriptorAllocatorGrowable,
+    ) -> MaterialInstance {
+        let pipeline = if pass == MaterialPass::Transparent {
+            &self.transparent_pipeline
+        } else {
+            &self.opaque_pipeline
+        };
+
+        let material_set = descriptor_allocator.allocate(self.material_layout.handle);
+
+        let mut desc_writer = DescriptorWriter::new();
+        desc_writer.write_buffer(
+            0,
+            resources.data_buffer,
+            size_of::<MaterialConstants>() as u64,
+            resources.data_buffer_offset,
+            descriptors::BufferDescriptorType::UniformBuffer,
+        );
+        desc_writer.write_image(
+            1,
+            resources.color_image.image_view,
+            resources.color_sampler.handle,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        );
+        desc_writer.write_image(
+            2,
+            resources.metal_rough_image.image_view,
+            resources.metal_rough_sampler.handle,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        );
+
+        desc_writer.update_set(device.clone(), material_set);
+
+        let mat_data = MaterialInstance {
+            pipeline: Arc::new(pipeline),
+            material_set,
+            pass_type: pass,
+        };
+
+        mat_data
+    }
+}
+
+#[repr(C)]
+pub struct MaterialConstants {
+    color_factors: glam::Vec4,
+    metal_rough_factors: glam::Vec4,
+    //padding, we need it anyway for uniform buffers
+    extra: [glam::Vec4; 14],
+}
+
+struct MaterialResources {
+    color_image: AllocatedImage,
+    color_sampler: Sampler,
+    metal_rough_image: AllocatedImage,
+    metal_rough_sampler: Sampler,
+    data_buffer: vk::Buffer,
+    data_buffer_offset: u64,
 }

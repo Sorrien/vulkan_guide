@@ -61,6 +61,7 @@ impl Drop for PipelineLayout {
     }
 }
 
+#[derive(Clone)]
 pub struct PipelineBuilder<'a> {
     input_assembly: vk::PipelineInputAssemblyStateCreateInfo<'a>,
     shader_stages: Vec<vk::PipelineShaderStageCreateInfo<'a>>,
@@ -224,7 +225,7 @@ impl PipelineBuilder<'_> {
         self
     }
 
-    pub fn build_pipeline(self, device: Arc<LogicalDevice>) -> Result<vk::Pipeline, vk::Result> {
+    pub fn build_pipeline(self, device: Arc<LogicalDevice>) -> Result<Pipeline, vk::Result> {
         let viewport_state = vk::PipelineViewportStateCreateInfo::default()
             .viewport_count(1)
             .scissor_count(1);
@@ -267,7 +268,12 @@ impl PipelineBuilder<'_> {
         };
 
         if let Ok(new_pipelines) = result {
-            Ok(new_pipelines[0])
+            let new_pipeline = new_pipelines[0];
+            Ok(Pipeline::new(
+                device.clone(),
+                new_pipeline,
+                self.pipeline_layout,
+            ))
         } else {
             let (_, error) = result.err().unwrap();
             Err(error)

@@ -660,20 +660,18 @@ impl BaseVulkanState {
         let pipeline_layout = PipelineLayout::new(self.device.clone(), pipeline_layout_info)
             .expect("failed to create triangle pipeline layout!");
 
-        let vk_pipeline = PipelineBuilder::new(pipeline_layout.clone())
+        let pipeline = PipelineBuilder::new(pipeline_layout.clone())
             .set_shaders(triangle_vert_shader, triangle_frag_shader)
             .set_input_topology(vk::PrimitiveTopology::TRIANGLE_LIST)
             .set_polygon_mode(vk::PolygonMode::FILL)
             .set_cull_mode(vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
             .set_multisampling_none()
             .disable_blending()
-            //.enable_blending_additive()
             .enable_depth_test(true, vk::CompareOp::GREATER_OR_EQUAL)
             .set_color_attachment_format(draw_image_format)
             .set_depth_attachment_format(depth_image_format)
             .build_pipeline(self.device.clone())
             .expect("failed to create triangle pipeline!");
-        let pipeline = Pipeline::new(self.device.clone(), vk_pipeline, pipeline_layout.clone());
 
         unsafe {
             self.device
