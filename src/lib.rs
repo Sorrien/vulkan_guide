@@ -1245,8 +1245,8 @@ pub struct RenderObject {
     vertex_buffer_address: vk::DeviceAddress,
 }
 
-pub struct MaterialInstance<'a> {
-    pipeline: &'a Pipeline,
+pub struct MaterialInstance {
+    pipeline: Arc<Pipeline>,
     material_set: vk::DescriptorSet,
     pass_type: MaterialPass,
 }
@@ -1259,8 +1259,8 @@ pub enum MaterialPass {
 }
 
 pub struct GLTFMetallicRoughness {
-    opaque_pipeline: Pipeline,
-    transparent_pipeline: Pipeline,
+    opaque_pipeline: Arc<Pipeline>,
+    transparent_pipeline: Arc<Pipeline>,
 
     material_layout: DescriptorLayout,
 }
@@ -1281,8 +1281,8 @@ impl GLTFMetallicRoughness {
             Self::build_pipelines(engine, material_layout);
 
         Self {
-            opaque_pipeline,
-            transparent_pipeline,
+            opaque_pipeline: Arc::new(opaque_pipeline),
+            transparent_pipeline: Arc::new(transparent_pipeline),
             material_layout: DescriptorLayout::new(engine.base.device.clone(), material_layout),
         }
     }
@@ -1363,9 +1363,9 @@ impl GLTFMetallicRoughness {
         descriptor_allocator: &mut DescriptorAllocatorGrowable,
     ) -> MaterialInstance {
         let pipeline = if pass == MaterialPass::Transparent {
-            &self.transparent_pipeline
+            self.transparent_pipeline.clone()
         } else {
-            &self.opaque_pipeline
+            self.opaque_pipeline.clone()
         };
 
         let material_set = descriptor_allocator.allocate(self.material_layout.handle);
@@ -1396,7 +1396,7 @@ impl GLTFMetallicRoughness {
         desc_writer.update_set(device.clone(), material_set);
 
         let mat_data = MaterialInstance {
-            pipeline: Arc::new(pipeline),
+            pipeline,
             material_set,
             pass_type: pass,
         };
@@ -1413,7 +1413,7 @@ pub struct MaterialConstants {
     extra: [glam::Vec4; 14],
 }
 
-struct MaterialResources {
+pub struct MaterialResources {
     color_image: AllocatedImage,
     color_sampler: Sampler,
     metal_rough_image: AllocatedImage,
