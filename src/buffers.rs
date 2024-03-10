@@ -1,5 +1,7 @@
 use std::{
+    ffi::c_void,
     mem::ManuallyDrop,
+    ptr,
     sync::{Arc, Mutex},
 };
 
@@ -84,6 +86,12 @@ pub fn copy_to_staging_buffer<DataType: std::marker::Copy>(
     let mut align =
         unsafe { Align::new(ptr, std::mem::align_of::<DataType>() as u64, size as u64) };
     align.copy_from_slice(&data);
+}
+
+pub fn write_to_cpu_buffer<T>(data: &T, allocated_buffer: &mut AllocatedBuffer) {
+    let ptr = allocated_buffer.allocation.mapped_ptr().unwrap().as_ptr();
+    let scene_data_ptr = data as *const _ as *const c_void;
+    unsafe { ptr::write(ptr, ptr::read(scene_data_ptr)) };
 }
 
 pub fn copy_buffer_to_image(

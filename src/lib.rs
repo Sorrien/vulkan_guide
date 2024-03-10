@@ -11,13 +11,14 @@ use ash::vk;
 use ash_bootstrap::LogicalDevice;
 use base_vulkan::{BaseVulkanState, FrameData};
 use buffers::{
-    copy_buffer_to_image, copy_to_staging_buffer, GPUDrawPushConstants, GPUMeshBuffers, MeshAsset,
-    Vertex,
+    copy_buffer_to_image, copy_to_staging_buffer, write_to_cpu_buffer, AllocatedBuffer,
+    GPUDrawPushConstants, GPUMeshBuffers, MeshAsset, Vertex,
 };
 use descriptors::{
     Descriptor, DescriptorAllocator, DescriptorAllocatorGrowable, DescriptorLayout,
     DescriptorLayoutBuilder, DescriptorWriter,
 };
+use generational_arena::Arena;
 use gltf::Material;
 use gpu_allocator::{vulkan::*, MemoryLocation};
 use image::RgbaImage;
@@ -45,6 +46,9 @@ pub mod vk_imgui;
 const FRAME_OVERLAP: usize = 2;
 
 pub struct VulkanEngine {
+    allocated_image_arena: Arena<AllocatedImage>,
+    default_data: Option<MaterialInstance>,
+    metal_rough_material: Option<GLTFMetallicRoughness>,
     default_sampler_linear: Sampler,
     default_sampler_nearest: Sampler,
     white_image: Option<AllocatedImage>,
@@ -66,7 +70,7 @@ pub struct VulkanEngine {
     background_effects: Vec<ComputeEffect>,
     background_effect_pipeline_layout: Arc<PipelineLayout>,
     draw_image_descriptor: Descriptor,
-    global_descriptor_allocator: descriptors::DescriptorAllocator,
+    global_descriptor_allocator: descriptors::DescriptorAllocatorGrowable,
     draw_image: AllocatedImage,
     depth_image: AllocatedImage,
     frames: Vec<Arc<Mutex<FrameData>>>,
@@ -113,7 +117,7 @@ impl VulkanEngine {
             vk::SampleCountFlags::TYPE_1,
         );
 
-        let mut global_descriptor_allocator = DescriptorAllocator::new(base.device.clone());
+        let mut global_descriptor_allocator = DescriptorAllocatorGrowable::new(base.device.clone());
 
         let draw_image_descriptor =
             base.init_descriptors(&mut global_descriptor_allocator, &draw_image_allocated);
@@ -165,7 +169,22 @@ impl VulkanEngine {
             default_sampler_linear,
             default_sampler_nearest,
             single_image_descriptor_layout,
+            default_data: None,
+            metal_rough_material: None,
+            allocated_image_arena: Arena::<AllocatedImage>::new(),
         }
+    }
+
+    pub fn init_pipelines(&mut self) {
+        let mut material_constants_buffer = self.base.create_buffer(
+            "gltf material constants",
+            size_of::<MaterialConstants>(),
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            MemoryLocation::CpuToGpu,
+        );
+
+        self.metal_rough_material =
+            Some(GLTFMetallicRoughness::new(&self, material_constants_buffer));
     }
 
     pub fn init_default_data(&mut self) {
@@ -174,6 +193,24 @@ impl VulkanEngine {
         }
 
         let white: [u8; 4] = [255, 255, 255, 255];
+
+        /*         let white_image_handle =
+        self.allocated_image_arena
+            .insert(self.create_allocated_texture_image(
+                &[white],
+                vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageTiling::OPTIMAL,
+                vk::ImageUsageFlags::SAMPLED,
+                MemoryLocation::GpuOnly,
+                1,
+                vk::SampleCountFlags::TYPE_1,
+            )); */
+
         self.white_image = Some(self.create_allocated_texture_image(
             &[white],
             vk::Extent3D {
@@ -265,6 +302,44 @@ impl VulkanEngine {
                 .create_sampler(&linear_sampler_create_info, None)
         }
         .expect("failed to create nearest linear sampler!");
+
+        /* let mut material_constants_buffer = self.base.create_buffer(
+            "gltf material constants",
+            size_of::<MaterialConstants>(),
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            MemoryLocation::CpuToGpu,
+        ); */
+
+        if let Some(ref mut metal_rough_material) = &mut self.metal_rough_material {
+            let material_constants = MaterialConstants {
+                color_factors: glam::Vec4::new(1., 1., 1., 1.),
+                metal_rough_factors: glam::Vec4::new(1., 0.5, 0., 0.),
+                extra: [glam::Vec4::ZERO; 14],
+            };
+
+            write_to_cpu_buffer(
+                &material_constants,
+                &mut metal_rough_material.material_constants_buffer,
+            );
+
+            //let white_image = self.allocated_image_arena.get(white_image_handle).unwrap();
+            let white_image = self.white_image.as_ref().unwrap();
+            let material_resources = MaterialResources {
+                color_image: white_image, //self.allocated_image_arena.get(white_image_handle).unwrap(), //self.white_image.unwrap(),
+                color_sampler: &self.default_sampler_linear,
+                metal_rough_image: white_image,
+                metal_rough_sampler: &self.default_sampler_linear,
+                data_buffer: metal_rough_material.material_constants_buffer.buffer,
+                data_buffer_offset: 0,
+            };
+
+            self.default_data = Some(metal_rough_material.write_material(
+                self.base.device.clone(),
+                MaterialPass::MainColor,
+                &material_resources,
+                &mut self.global_descriptor_allocator,
+            ));
+        }
     }
 
     pub fn init_imgui(
@@ -802,14 +877,15 @@ impl VulkanEngine {
     }
 
     fn draw_geometry(&self, cmd: vk::CommandBuffer, frame: &mut MutexGuard<'_, FrameData>) {
-        let ptr = frame
+        /*         let ptr = frame
             .gpu_scene_data_buffer
             .allocation
             .mapped_ptr()
             .unwrap()
             .as_ptr();
         let scene_data_ptr = &self.scene_data as *const _ as *const c_void;
-        unsafe { ptr::write(ptr, ptr::read(scene_data_ptr)) };
+        unsafe { ptr::write(ptr, ptr::read(scene_data_ptr)) }; */
+        write_to_cpu_buffer(&self.scene_data, &mut frame.gpu_scene_data_buffer);
 
         let global_descriptor = frame
             .frame_descriptors
@@ -1130,12 +1206,12 @@ impl Drop for Sampler {
 
 pub struct AllocatedImage {
     device: Arc<LogicalDevice>,
-    allocator: Arc<Mutex<Allocator>>,
-    image: vk::Image,
-    image_view: vk::ImageView,
-    allocation: ManuallyDrop<Allocation>,
-    extent: vk::Extent3D,
-    format: vk::Format,
+    pub allocator: Arc<Mutex<Allocator>>,
+    pub image: vk::Image,
+    pub image_view: vk::ImageView,
+    pub allocation: ManuallyDrop<Allocation>,
+    pub extent: vk::Extent3D,
+    pub format: vk::Format,
 }
 
 impl Drop for AllocatedImage {
@@ -1258,15 +1334,32 @@ pub enum MaterialPass {
     Other = 3,
 }
 
+#[repr(C)]
+pub struct MaterialConstants {
+    color_factors: glam::Vec4,
+    metal_rough_factors: glam::Vec4,
+    //padding, we need it anyway for uniform buffers
+    extra: [glam::Vec4; 14],
+}
+
+pub struct MaterialResources<'a> {
+    color_image: &'a AllocatedImage,
+    color_sampler: &'a Sampler,
+    metal_rough_image: &'a AllocatedImage,
+    metal_rough_sampler: &'a Sampler,
+    data_buffer: vk::Buffer,
+    data_buffer_offset: u64,
+}
+
 pub struct GLTFMetallicRoughness {
     opaque_pipeline: Arc<Pipeline>,
     transparent_pipeline: Arc<Pipeline>,
-
     material_layout: DescriptorLayout,
+    material_constants_buffer: AllocatedBuffer,
 }
 
 impl GLTFMetallicRoughness {
-    pub fn new(engine: &VulkanEngine) -> Self {
+    pub fn new(engine: &VulkanEngine, material_constants_buffer: AllocatedBuffer) -> Self {
         let material_layout = DescriptorLayoutBuilder::new()
             .add_binding(0, vk::DescriptorType::UNIFORM_BUFFER)
             .add_binding(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -1284,6 +1377,7 @@ impl GLTFMetallicRoughness {
             opaque_pipeline: Arc::new(opaque_pipeline),
             transparent_pipeline: Arc::new(transparent_pipeline),
             material_layout: DescriptorLayout::new(engine.base.device.clone(), material_layout),
+            material_constants_buffer,
         }
     }
 
@@ -1291,8 +1385,14 @@ impl GLTFMetallicRoughness {
         engine: &VulkanEngine,
         material_layout: vk::DescriptorSetLayout,
     ) -> (Pipeline, Pipeline) {
-        let mesh_frag_shader = engine.base.create_shader_module("/shaders/mesh.frag.spv");
-        let mesh_vert_shader = engine.base.create_shader_module("/shaders/mesh.vert.spv");
+        let mesh_frag_shader = engine
+            .base
+            .create_shader_module("shaders/mesh.frag.spv")
+            .expect("failed to load shader module!");
+        let mesh_vert_shader = engine
+            .base
+            .create_shader_module("shaders/mesh.vert.spv")
+            .expect("failed to load shader module!");
 
         let matrix_range = vk::PushConstantRange::default()
             .offset(0)
@@ -1315,6 +1415,7 @@ impl GLTFMetallicRoughness {
         let pipeline_builder = PipelineBuilder::new(new_layout)
             .set_shaders(mesh_vert_shader, mesh_frag_shader)
             .set_input_topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+            .set_polygon_mode(vk::PolygonMode::FILL)
             .set_cull_mode(vk::CullModeFlags::NONE, vk::FrontFace::CLOCKWISE)
             .set_multisampling_none()
             .set_color_attachment_format(engine.draw_image.format)
@@ -1405,19 +1506,15 @@ impl GLTFMetallicRoughness {
     }
 }
 
-#[repr(C)]
-pub struct MaterialConstants {
-    color_factors: glam::Vec4,
-    metal_rough_factors: glam::Vec4,
-    //padding, we need it anyway for uniform buffers
-    extra: [glam::Vec4; 14],
+pub struct DrawContext {}
+pub trait Renderable {
+    fn draw(top_matrix: &glam::Mat4, context: &DrawContext);
 }
 
-pub struct MaterialResources {
-    color_image: AllocatedImage,
-    color_sampler: Sampler,
-    metal_rough_image: AllocatedImage,
-    metal_rough_sampler: Sampler,
-    data_buffer: vk::Buffer,
-    data_buffer_offset: u64,
+pub struct Node {}
+
+impl Renderable for Node {
+    fn draw(top_matrix: &glam::Mat4, context: &DrawContext) {
+        todo!()
+    }
 }

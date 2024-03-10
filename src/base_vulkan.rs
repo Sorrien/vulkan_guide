@@ -35,6 +35,14 @@ use crate::{
     swapchain, AllocatedImage, ComputeEffect, ComputePushConstants, GPUSceneData,
 };
 
+#[derive(Debug)]
+pub enum ShaderModuleError {
+    Unknown,
+    FileError(std::io::Error),
+    ReadSPVError(std::io::Error),
+    CreateShaderModuleError(ash::vk::Result),
+}
+
 pub struct BaseVulkanState {
     pub msaa_samples: vk::SampleCountFlags,
     pub queue_family_indices: QueueFamilyIndices,
@@ -421,20 +429,43 @@ impl BaseVulkanState {
         }
     }
 
-    pub fn create_shader_module<P>(&self, path: P) -> vk::ShaderModule
+    pub fn create_shader_module<P>(&self, path: P) -> Result<vk::ShaderModule, ShaderModuleError>
     where
         P: AsRef<Path>,
     {
-        let mut spv_file = File::open(path).unwrap();
-        let shader_code = read_spv(&mut spv_file).expect("Failed to read shader spv file");
-        let vertex_shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
-        let shader_module = unsafe {
-            self.device
-                .handle
-                .create_shader_module(&vertex_shader_info, None)
-                .expect("shader module error")
-        };
-        shader_module
+        match File::open(path) {
+            Ok(mut spv_file) => match read_spv(&mut spv_file) {
+                Ok(shader_code) => {
+                    let vertex_shader_info =
+                        vk::ShaderModuleCreateInfo::default().code(&shader_code);
+                    match unsafe {
+                        self.device
+                            .handle
+                            .create_shader_module(&vertex_shader_info, None)
+                    } {
+                        Ok(shader_module) => Ok(shader_module),
+                        Err(shader_error) => {
+                            Err(ShaderModuleError::CreateShaderModuleError(shader_error))
+                        }
+                    }
+                }
+                Err(read_spv_error) => Err(ShaderModuleError::ReadSPVError(read_spv_error)),
+            },
+            Err(file_err) => Err(ShaderModuleError::FileError(file_err)),
+        }
+        /*         if let Ok(mut spv_file) = File::open(path) {
+            let shader_code = read_spv(&mut spv_file).expect("Failed to read shader spv file");
+            let vertex_shader_info = vk::ShaderModuleCreateInfo::default().code(&shader_code);
+            let shader_module = unsafe {
+                self.device
+                    .handle
+                    .create_shader_module(&vertex_shader_info, None)
+                    .expect("shader module error")
+            };
+            Ok(shader_module)
+        } else {
+            E
+        } */
     }
 
     pub fn init_pipelines(
@@ -469,8 +500,12 @@ impl BaseVulkanState {
             PipelineLayout::new(self.device.clone(), compute_layout_create_info)
                 .expect("failed to create compute effect pipeline layout!");
 
-        let gradient_shader = self.create_shader_module("shaders/gradient.comp.spv");
-        let sky_shader = self.create_shader_module("shaders/sky.comp.spv");
+        let gradient_shader = self
+            .create_shader_module("shaders/gradient.comp.spv")
+            .expect("failed to load shader module!");
+        let sky_shader = self
+            .create_shader_module("shaders/sky.comp.spv")
+            .expect("failed to load shader module!");
 
         let shader_entry_name = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
 
@@ -540,7 +575,7 @@ impl BaseVulkanState {
 
     pub fn init_descriptors(
         &mut self,
-        global_descriptor_allocator: &mut DescriptorAllocator,
+        global_descriptor_allocator: &mut DescriptorAllocatorGrowable,
         draw_image: &AllocatedImage,
     ) -> Descriptor {
         let draw_image_desc_ty = vk::DescriptorType::STORAGE_IMAGE;
@@ -549,16 +584,15 @@ impl BaseVulkanState {
             ratio: 1.,
         }];
 
-        global_descriptor_allocator.init_pool(10, sizes);
+        global_descriptor_allocator.init(10, sizes);
 
         let draw_image_descriptor_layout = DescriptorLayoutBuilder::new()
             .add_binding(0, draw_image_desc_ty)
             .build(self.device.clone(), vk::ShaderStageFlags::COMPUTE)
             .expect("failed to create draw image descriptor layout!");
 
-        let draw_image_descriptors = global_descriptor_allocator
-            .allocate(vec![draw_image_descriptor_layout])
-            .unwrap()[0];
+        let draw_image_descriptors =
+            global_descriptor_allocator.allocate(draw_image_descriptor_layout);
 
         let mut desc_writer = DescriptorWriter::new();
 
@@ -642,9 +676,12 @@ impl BaseVulkanState {
         depth_image_format: vk::Format,
         single_image_descriptor_layout: &DescriptorLayout,
     ) -> (Pipeline, Arc<PipelineLayout>) {
-        let triangle_vert_shader =
-            self.create_shader_module("shaders/colored_triangle_mesh.vert.spv");
-        let triangle_frag_shader = self.create_shader_module("shaders/text_image.frag.spv");
+        let triangle_vert_shader = self
+            .create_shader_module("shaders/colored_triangle_mesh.vert.spv")
+            .expect("failed to load shader module!");
+        let triangle_frag_shader = self
+            .create_shader_module("shaders/text_image.frag.spv")
+            .expect("failed to load shader module!");
 
         let buffer_range = vk::PushConstantRange::default()
             .offset(0)
