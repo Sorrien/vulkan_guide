@@ -1,5 +1,7 @@
-use ash::extensions::ext::DebugUtils;
+use ash::extensions::ext::{self, DebugUtils};
+use ash::vk::StructureType;
 use ash::{vk, Entry};
+use std::any::Any;
 use std::borrow::Cow;
 use std::ffi::CStr;
 use std::sync::Arc;
@@ -106,4 +108,20 @@ pub fn create_debug_info() -> vk::DebugUtilsMessengerCreateInfoEXT<'static> {
         )
         .pfn_user_callback(Some(vulkan_debug_callback));
     x
+}
+
+pub fn set_debug_utils_object_name<T: vk::Handle>(
+    debug_utils_loader: &ext::DebugUtils,
+    device: vk::Device,
+    object_handle: T,
+    object_name: &str,
+) {
+    let name_cstr = std::ffi::CString::new(object_name).expect("wrong string parameter");
+
+    let mut name_info = vk::DebugUtilsObjectNameInfoEXT::default()
+        .object_handle(object_handle)
+        .object_name(&name_cstr);
+    name_info.s_type = StructureType::from_raw(T::TYPE.as_raw());
+
+    let _ = unsafe { debug_utils_loader.set_debug_utils_object_name(device, &name_info) };
 }

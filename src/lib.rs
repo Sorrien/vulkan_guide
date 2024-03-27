@@ -1,8 +1,6 @@
 use std::{
-    array,
-    ffi::c_void,
+    collections::HashMap,
     mem::{size_of, ManuallyDrop},
-    ptr::{self, NonNull},
     sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
@@ -18,9 +16,8 @@ use descriptors::{
     Descriptor, DescriptorAllocator, DescriptorAllocatorGrowable, DescriptorLayout,
     DescriptorLayoutBuilder, DescriptorWriter,
 };
-use generational_arena::Arena;
-use gltf::Material;
 use gpu_allocator::{vulkan::*, MemoryLocation};
+use hecs::{Entity, World};
 use image::RgbaImage;
 use pipelines::{Pipeline, PipelineBuilder};
 use swapchain::MySwapchain;
@@ -46,8 +43,10 @@ pub mod vk_imgui;
 const FRAME_OVERLAP: usize = 2;
 
 pub struct VulkanEngine {
-    allocated_image_arena: Arena<AllocatedImage>,
-    default_data: Option<MaterialInstance>,
+    loaded_nodes: HashMap<String, Entity>,
+    world: World,
+    main_draw_context: DrawContext,
+    default_data: Option<Arc<MaterialInstance>>,
     metal_rough_material: Option<GLTFMetallicRoughness>,
     default_sampler_linear: Sampler,
     default_sampler_nearest: Sampler,
@@ -62,7 +61,7 @@ pub struct VulkanEngine {
     current_background_effect: usize,
     frame_number: usize,
     gpu_scene_data_descriptor_layout: DescriptorLayout,
-    meshes: Vec<MeshAsset>,
+    meshes: Vec<Arc<MeshAsset>>,
     mesh_pipeline: Pipeline,
     mesh_pipeline_layout: Arc<PipelineLayout>,
     single_image_descriptor_layout: DescriptorLayout,
@@ -171,12 +170,14 @@ impl VulkanEngine {
             single_image_descriptor_layout,
             default_data: None,
             metal_rough_material: None,
-            allocated_image_arena: Arena::<AllocatedImage>::new(),
+            main_draw_context: DrawContext::new(),
+            world: World::new(),
+            loaded_nodes: HashMap::new(),
         }
     }
 
     pub fn init_pipelines(&mut self) {
-        let mut material_constants_buffer = self.base.create_buffer(
+        let material_constants_buffer = self.base.create_buffer(
             "gltf material constants",
             size_of::<MaterialConstants>(),
             vk::BufferUsageFlags::UNIFORM_BUFFER,
@@ -188,10 +189,6 @@ impl VulkanEngine {
     }
 
     pub fn init_default_data(&mut self) {
-        if let Some(mut meshes) = loader::load_gltf_meshes(self, "assets/basicmesh.glb") {
-            self.meshes.append(&mut meshes);
-        }
-
         let white: [u8; 4] = [255, 255, 255, 255];
 
         /*         let white_image_handle =
@@ -303,16 +300,9 @@ impl VulkanEngine {
         }
         .expect("failed to create nearest linear sampler!");
 
-        /* let mut material_constants_buffer = self.base.create_buffer(
-            "gltf material constants",
-            size_of::<MaterialConstants>(),
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            MemoryLocation::CpuToGpu,
-        ); */
-
         if let Some(ref mut metal_rough_material) = &mut self.metal_rough_material {
             let material_constants = MaterialConstants {
-                color_factors: glam::Vec4::new(1., 1., 1., 1.),
+                colorFactors: glam::Vec4::new(1., 1., 1., 1.),
                 metal_rough_factors: glam::Vec4::new(1., 0.5, 0., 0.),
                 extra: [glam::Vec4::ZERO; 14],
             };
@@ -322,10 +312,9 @@ impl VulkanEngine {
                 &mut metal_rough_material.material_constants_buffer,
             );
 
-            //let white_image = self.allocated_image_arena.get(white_image_handle).unwrap();
             let white_image = self.white_image.as_ref().unwrap();
             let material_resources = MaterialResources {
-                color_image: white_image, //self.allocated_image_arena.get(white_image_handle).unwrap(), //self.white_image.unwrap(),
+                color_image: white_image,
                 color_sampler: &self.default_sampler_linear,
                 metal_rough_image: white_image,
                 metal_rough_sampler: &self.default_sampler_linear,
@@ -333,13 +322,86 @@ impl VulkanEngine {
                 data_buffer_offset: 0,
             };
 
-            self.default_data = Some(metal_rough_material.write_material(
+            let default_material = Arc::new(metal_rough_material.write_material(
                 self.base.device.clone(),
                 MaterialPass::MainColor,
                 &material_resources,
                 &mut self.global_descriptor_allocator,
             ));
+
+            self.default_data = Some(default_material.clone());
+
+            if let Some(meshes) =
+                loader::load_gltf_meshes(self, "assets/basicmesh.glb", default_material.clone())
+            {
+                self.meshes = meshes
+                    .into_iter()
+                    .map(|mesh| Arc::new(mesh))
+                    .collect::<Vec<_>>();
+            }
+
+            for mesh in &self.meshes {
+                let mesh_entity = self.world.spawn((
+                    TransformComponent {
+                        transform: glam::Mat4::IDENTITY,
+                    },
+                    MeshHandleComponent { mesh: mesh.clone() },
+                ));
+
+                self.loaded_nodes.insert(mesh.name.clone(), mesh_entity);
+            }
+        } else {
+            panic!("Missing metal rough material!");
         }
+    }
+
+    pub fn update_scene(&mut self) {
+        evaluate_relative_transforms(&mut self.world);
+
+        self.main_draw_context.opaque_surfaces.clear();
+
+        let suzanne_entity = self.loaded_nodes["Suzanne"];
+
+        let model = glam::Mat4::IDENTITY * glam::Mat4::from_axis_angle(glam::Vec3::Y, 0.);
+
+        draw_entity(
+            &mut self.world,
+            suzanne_entity,
+            &model,
+            &mut self.main_draw_context,
+        );
+
+        let cube_entity = self.loaded_nodes["Cube"];
+
+        for x in -3..3 {
+            draw_entity(
+                &mut self.world,
+                cube_entity,
+                &(glam::Mat4::from_scale(glam::Vec3::new(0.2, 0.2, 0.2))
+                    * glam::Mat4::from_translation(glam::Vec3::new(x as f32, -5., 0.))),
+                &mut self.main_draw_context,
+            );
+        }
+
+        self.scene_data.view = glam::Mat4::look_at_rh(
+            glam::Vec3::new(0., 0., -5.),
+            glam::Vec3::new(0., 0., 0.),
+            glam::Vec3::Y,
+        );
+
+        self.scene_data.proj = glam::Mat4::perspective_rh_gl(
+            70.,
+            self.draw_extent.width as f32 / self.draw_extent.height as f32,
+            0.1,
+            10000.,
+        );
+        self.scene_data.proj.y_axis *= -1.;
+
+        self.scene_data.viewproj = self.scene_data.proj * self.scene_data.view; // * model;
+
+        self.scene_data.ambientColor = glam::Vec4::ONE;
+        self.scene_data.sunlightColor = glam::Vec4::ONE;
+        self.scene_data.sunlightDirection = glam::Vec4::new(0., 1., 0.5, 1.);
     }
 
     pub fn init_imgui(
@@ -498,6 +560,8 @@ impl VulkanEngine {
         draw_data: &imgui::DrawData,
         imgui_renderer: &mut imgui_rs_vulkan_renderer::Renderer,
     ) {
+        self.update_scene();
+
         let current_frame = self.get_current_frame();
         let mut current_frame = current_frame.lock().unwrap();
         let fences = [current_frame.render_fence];
@@ -746,7 +810,6 @@ impl VulkanEngine {
             )
         }
         let descriptor_sets = [self.draw_image_descriptor.set];
-        let dynamic_offsets = [];
         unsafe {
             self.base.device.handle.cmd_bind_descriptor_sets(
                 cmd,
@@ -754,22 +817,18 @@ impl VulkanEngine {
                 cur_effect.pipeline.pipeline_layout.handle,
                 0,
                 &descriptor_sets,
-                &dynamic_offsets,
+                &[],
             )
         };
 
-        let pc = &cur_effect.data;
-
-        unsafe {
-            let push = any_as_u8_slice(pc);
-            self.base.device.handle.cmd_push_constants(
-                cmd,
-                cur_effect.pipeline.pipeline_layout.handle,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                push,
-            )
-        };
+        cmd_push_constants(
+            self.base.device.clone(),
+            cmd,
+            cur_effect.pipeline.pipeline_layout.clone(),
+            cur_effect.data,
+            vk::ShaderStageFlags::COMPUTE,
+            0,
+        );
 
         unsafe {
             self.base.device.handle.cmd_dispatch(
@@ -877,14 +936,6 @@ impl VulkanEngine {
     }
 
     fn draw_geometry(&self, cmd: vk::CommandBuffer, frame: &mut MutexGuard<'_, FrameData>) {
-        /*         let ptr = frame
-            .gpu_scene_data_buffer
-            .allocation
-            .mapped_ptr()
-            .unwrap()
-            .as_ptr();
-        let scene_data_ptr = &self.scene_data as *const _ as *const c_void;
-        unsafe { ptr::write(ptr, ptr::read(scene_data_ptr)) }; */
         write_to_cpu_buffer(&self.scene_data, &mut frame.gpu_scene_data_buffer);
 
         let global_descriptor = frame
@@ -942,98 +993,67 @@ impl VulkanEngine {
         let scissors = [scissor];
         unsafe { self.base.device.handle.cmd_set_scissor(cmd, 0, &scissors) };
 
-        unsafe {
-            self.base.device.handle.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.mesh_pipeline.pipeline,
-            )
-        };
-
-        if let Some(image) = &self.error_checkerboard_image {
-            let image_set = frame
-                .frame_descriptors
-                .allocate(self.single_image_descriptor_layout.handle);
-            {
-                let mut descriptor_writer = DescriptorWriter::new();
-                descriptor_writer.write_image(
-                    0,
-                    image.image_view,
-                    self.default_sampler_nearest.handle,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        for draw in &self.main_draw_context.opaque_surfaces {
+            unsafe {
+                self.base.device.handle.cmd_bind_pipeline(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    draw.material.pipeline.pipeline,
                 );
-
-                descriptor_writer.update_set(self.base.device.clone(), image_set);
-            }
-
-            let mesh_pipeline_desc_sets = [image_set];
-
+            };
+            let draw_pipeline_desc_sets_1 = [global_descriptor];
+            let draw_pipeline_desc_sets_2 = [draw.material.material_set];
             unsafe {
                 self.base.device.handle.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::GRAPHICS,
-                    self.mesh_pipeline_layout.handle,
+                    draw.material.pipeline.pipeline_layout.handle,
                     0,
-                    &mesh_pipeline_desc_sets,
+                    &draw_pipeline_desc_sets_1,
                     &[],
+                );
+                self.base.device.handle.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    draw.material.pipeline.pipeline_layout.handle,
+                    1,
+                    &draw_pipeline_desc_sets_2,
+                    &[],
+                );
+            };
+
+            let draw_push_constants =
+                GPUDrawPushConstants::new(draw.transform, draw.vertex_buffer_address);
+
+            cmd_push_constants(
+                self.base.device.clone(),
+                cmd,
+                draw.material.pipeline.pipeline_layout.clone(),
+                draw_push_constants,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+            );
+
+            unsafe {
+                self.base.device.handle.cmd_bind_index_buffer(
+                    cmd,
+                    draw.index_buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                )
+            };
+
+            unsafe {
+                self.base.device.handle.cmd_draw_indexed(
+                    cmd,
+                    draw.index_count,
+                    1,
+                    draw.first_index,
+                    0,
+                    0,
                 )
             };
         }
-
-        //for mesh in &self.meshes {
-        let mesh = &self.meshes[2];
-
-        let model = glam::Mat4::IDENTITY * glam::Mat4::from_axis_angle(glam::Vec3::Y, 0.);
-
-        let view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(0., 0., -5.),
-            glam::Vec3::new(0., 0., 0.),
-            glam::Vec3::Y,
-        );
-        let mut proj = glam::Mat4::perspective_rh_gl(
-            70.,
-            self.draw_extent.width as f32 / self.draw_extent.height as f32,
-            0.1,
-            10000.,
-        );
-        proj.y_axis *= -1.;
-
-        let draw_push_constants =
-            GPUDrawPushConstants::new(proj * view * model, mesh.mesh_buffers.vertex_buffer_address);
-
-        let pc = [draw_push_constants];
-        unsafe {
-            let push = any_as_u8_slice(&pc);
-            self.base.device.handle.cmd_push_constants(
-                cmd,
-                self.mesh_pipeline_layout.handle,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                &push,
-            )
-        };
-
-        unsafe {
-            self.base.device.handle.cmd_bind_index_buffer(
-                cmd,
-                mesh.mesh_buffers.index_buffer.buffer,
-                0,
-                vk::IndexType::UINT32,
-            )
-        };
-
-        unsafe {
-            self.base.device.handle.cmd_draw_indexed(
-                cmd,
-                mesh.surfaces[0].count as u32,
-                1,
-                mesh.surfaces[0].start_index as u32,
-                0,
-                0,
-            )
-        };
-        //}
 
         unsafe { self.base.device.handle.cmd_end_rendering(cmd) };
     }
@@ -1281,6 +1301,7 @@ pub fn copy_image_to_image(
     unsafe { device.handle.cmd_blit_image2(cmd, &blit_info) };
 }
 
+#[derive(Copy, Clone)]
 pub struct ComputePushConstants {
     pub data1: glam::Vec4,
     pub data2: glam::Vec4,
@@ -1305,10 +1326,10 @@ pub struct ComputeEffect {
 pub struct GPUSceneData {
     view: glam::Mat4,
     proj: glam::Mat4,
-    view_prof: glam::Mat4,
-    ambient_color: glam::Vec4,
-    sunlight_direction: glam::Vec4,
-    sunlight_color: glam::Vec4,
+    viewproj: glam::Mat4,
+    ambientColor: glam::Vec4,
+    sunlightDirection: glam::Vec4,
+    sunlightColor: glam::Vec4,
 }
 
 pub struct RenderObject {
@@ -1319,6 +1340,18 @@ pub struct RenderObject {
     material: Arc<MaterialInstance>,
     transform: glam::Mat4,
     vertex_buffer_address: vk::DeviceAddress,
+}
+
+pub struct DrawContext {
+    opaque_surfaces: Vec<RenderObject>,
+}
+
+impl DrawContext {
+    pub fn new() -> Self {
+        Self {
+            opaque_surfaces: Vec::new(),
+        }
+    }
 }
 
 pub struct MaterialInstance {
@@ -1335,8 +1368,9 @@ pub enum MaterialPass {
 }
 
 #[repr(C)]
+#[derive(Copy, Clone, Default)]
 pub struct MaterialConstants {
-    color_factors: glam::Vec4,
+    colorFactors: glam::Vec4,
     metal_rough_factors: glam::Vec4,
     //padding, we need it anyway for uniform buffers
     extra: [glam::Vec4; 14],
@@ -1506,15 +1540,118 @@ impl GLTFMetallicRoughness {
     }
 }
 
-pub struct DrawContext {}
-pub trait Renderable {
-    fn draw(top_matrix: &glam::Mat4, context: &DrawContext);
+fn evaluate_relative_transforms(world: &mut World) {
+    let mut parents = world.query::<&ParentComponent>();
+    let parents = parents.view();
+
+    let mut roots = world
+        .query::<&TransformComponent>()
+        .without::<&ParentComponent>();
+    let roots = roots.view();
+
+    for (_entity, (parent, absolute)) in world
+        .query::<(&ParentComponent, &mut TransformComponent)>()
+        .iter()
+    {
+        let mut relative = parent.local_transform;
+        let mut ancestor = parent.parent;
+        while let Some(next) = parents.get(ancestor) {
+            relative = next.local_transform * relative;
+            ancestor = next.parent;
+        }
+        absolute.transform = roots.get(ancestor).unwrap().transform * relative;
+    }
 }
 
-pub struct Node {}
-
-impl Renderable for Node {
-    fn draw(top_matrix: &glam::Mat4, context: &DrawContext) {
-        todo!()
+fn draw_all(world: &mut World, top_matrix: &glam::Mat4, context: &mut DrawContext) {
+    for (_entity, (mesh_component, transform_component)) in world
+        .query::<(&MeshHandleComponent, &TransformComponent)>()
+        .iter()
+    {
+        let node_matrix = *top_matrix * transform_component.transform;
+        context.opaque_surfaces.append(&mut mesh_to_render_object(
+            node_matrix,
+            &mesh_component.mesh,
+        ));
     }
+}
+
+fn draw_entity(
+    world: &mut World,
+    draw_entity: Entity,
+    top_matrix: &glam::Mat4,
+    context: &mut DrawContext,
+) {
+    if let Some((_entity, (mesh_component, transform_component))) = world
+        .query::<(&MeshHandleComponent, &TransformComponent)>()
+        .iter()
+        .find(|(entity, _)| *entity == draw_entity)
+    {
+        let node_matrix = *top_matrix * transform_component.transform;
+        /*         for s in &mesh_component.mesh.surfaces {
+            let def = RenderObject {
+                index_count: s.count as u32,
+                first_index: s.start_index as u32,
+                index_buffer: mesh_component.mesh.mesh_buffers.index_buffer.buffer,
+                material: s.material.clone(),
+                transform: node_matrix,
+                vertex_buffer_address: mesh_component.mesh.mesh_buffers.vertex_buffer_address,
+            };
+            context.opaque_surfaces.push(def);
+        } */
+        context.opaque_surfaces.append(&mut mesh_to_render_object(
+            node_matrix,
+            &mesh_component.mesh,
+        ));
+    }
+}
+
+fn mesh_to_render_object(
+    node_matrix: glam::Mat4,
+    mesh_asset: &Arc<MeshAsset>,
+) -> Vec<RenderObject> {
+    let mut surfaces = vec![];
+    for s in &mesh_asset.surfaces {
+        let def = RenderObject {
+            index_count: s.count as u32,
+            first_index: s.start_index as u32,
+            index_buffer: mesh_asset.mesh_buffers.index_buffer.buffer,
+            material: s.material.clone(),
+            transform: node_matrix,
+            vertex_buffer_address: mesh_asset.mesh_buffers.vertex_buffer_address,
+        };
+        surfaces.push(def);
+    }
+    surfaces
+}
+
+#[derive(Debug, Copy, Clone, Default)]
+pub struct TransformComponent {
+    transform: glam::Mat4,
+}
+
+pub struct ParentComponent {
+    parent: Entity,
+    local_transform: glam::Mat4,
+}
+
+pub struct MeshHandleComponent {
+    mesh: Arc<MeshAsset>,
+}
+
+pub fn cmd_push_constants<T>(
+    device: Arc<LogicalDevice>,
+    cmd: vk::CommandBuffer,
+    pipeline_layout: Arc<PipelineLayout>,
+    push_constants: T,
+    stage_flags: vk::ShaderStageFlags,
+    offset: u32,
+) {
+    let pc = [push_constants];
+    unsafe {
+        let push = any_as_u8_slice(&pc);
+        device
+            .handle
+            .cmd_push_constants(cmd, pipeline_layout.handle, stage_flags, offset, &push)
+    };
 }

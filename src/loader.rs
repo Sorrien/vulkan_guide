@@ -1,15 +1,15 @@
-use std::{
-    fs::File,
-    io::{BufReader, Cursor, Read},
-    path::Path,
-};
+use std::{fs::File, io::Read, path::Path, sync::Arc};
 
 use crate::{
     buffers::{GeoSurface, MeshAsset, Vertex},
-    VulkanEngine,
+    MaterialInstance, VulkanEngine,
 };
 
-pub fn load_gltf_meshes<P>(engine: &mut VulkanEngine, path: P) -> Option<Vec<MeshAsset>>
+pub fn load_gltf_meshes<P>(
+    engine: &mut VulkanEngine,
+    path: P,
+    default_material: Arc<MaterialInstance>,
+) -> Option<Vec<MeshAsset>>
 where
     P: AsRef<Path>,
 {
@@ -58,6 +58,7 @@ where
                     let new_surface = GeoSurface {
                         start_index: indices.len(),
                         count: primitive_indices.len(),
+                        material: default_material.clone(),
                     };
 
                     surfaces.push(new_surface);
@@ -100,7 +101,7 @@ where
                     vertices.append(&mut primitive_vertices);
                 });
 
-                let override_colors = true;
+                let override_colors = false;
 
                 if override_colors {
                     vertices.iter_mut().for_each(|vertex| {

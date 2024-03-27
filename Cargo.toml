@@ -24,7 +24,7 @@ imgui-rs-vulkan-renderer = { git = "https://github.com/Sorrien/imgui-rs-vulkan-r
     "gpu-allocator",
     "dynamic-rendering",
 ] }
-generational-arena = "0.2"
+hecs = "0.10.4"
 
 [dependencies.gltf]
 version = "1"

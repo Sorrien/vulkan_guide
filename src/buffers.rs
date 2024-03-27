@@ -1,7 +1,6 @@
 use std::{
-    ffi::c_void,
-    mem::ManuallyDrop,
-    ptr,
+    mem::{self, ManuallyDrop},
+    ptr::{self, NonNull},
     sync::{Arc, Mutex},
 };
 
@@ -11,7 +10,7 @@ use gpu_allocator::{
     MemoryLocation,
 };
 
-use crate::ash_bootstrap::LogicalDevice;
+use crate::{ash_bootstrap::LogicalDevice, MaterialInstance};
 
 pub struct AllocatedBuffer {
     device: Arc<LogicalDevice>,
@@ -61,6 +60,14 @@ impl AllocatedBuffer {
             allocation: ManuallyDrop::new(allocation),
         }
     }
+
+    pub fn mapped_ptr<T: Sized>(&self) -> Option<NonNull<T>> {
+        if let Some(mapped_ptr) = self.allocation.mapped_ptr() {
+            Some(mapped_ptr.cast::<T>())
+        } else {
+            None
+        }
+    }
 }
 
 impl Drop for AllocatedBuffer {
@@ -89,9 +96,9 @@ pub fn copy_to_staging_buffer<DataType: std::marker::Copy>(
 }
 
 pub fn write_to_cpu_buffer<T>(data: &T, allocated_buffer: &mut AllocatedBuffer) {
-    let ptr = allocated_buffer.allocation.mapped_ptr().unwrap().as_ptr();
-    let scene_data_ptr = data as *const _ as *const c_void;
-    unsafe { ptr::write(ptr, ptr::read(scene_data_ptr)) };
+    let dst_ptr = allocated_buffer.allocation.mapped_ptr().unwrap().as_ptr();
+    let size = mem::size_of::<T>();
+    unsafe { ptr::copy_nonoverlapping(data as *const _ as *const u8, dst_ptr as *mut u8, size) };
 }
 
 pub fn copy_buffer_to_image(
@@ -166,6 +173,7 @@ pub use offset_of;
 pub struct GeoSurface {
     pub start_index: usize,
     pub count: usize,
+    pub material: Arc<MaterialInstance>,
 }
 
 pub struct MeshAsset {
@@ -181,6 +189,7 @@ pub struct GPUMeshBuffers {
     pub vertex_buffer_address: vk::DeviceAddress,
 }
 
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct GPUDrawPushConstants {
     world_matrix: glam::Mat4,

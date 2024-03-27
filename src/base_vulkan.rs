@@ -229,7 +229,7 @@ impl BaseVulkanState {
                 frame_descriptors.init(1000, frame_sizes);
 
                 let gpu_scene_data_buffer = self.create_buffer(
-                    &format!("gpuscendata buffer {}", i),
+                    &format!("gpuscenedata buffer {}", i),
                     size_of::<GPUSceneData>(),
                     vk::BufferUsageFlags::UNIFORM_BUFFER,
                     MemoryLocation::CpuToGpu,
