@@ -12,6 +12,7 @@ use buffers::{
     copy_buffer_to_image, copy_to_staging_buffer, write_to_cpu_buffer, AllocatedBuffer,
     GPUDrawPushConstants, GPUMeshBuffers, MeshAsset, Vertex,
 };
+use camera::Camera;
 use descriptors::{
     Descriptor, DescriptorAllocator, DescriptorAllocatorGrowable, DescriptorLayout,
     DescriptorLayoutBuilder, DescriptorWriter,
@@ -23,8 +24,9 @@ use pipelines::{Pipeline, PipelineBuilder};
 use swapchain::MySwapchain;
 use vk_imgui::init_imgui;
 use winit::{
-    event::{Event, WindowEvent},
+    event::{DeviceEvent, Event, KeyEvent, WindowEvent},
     event_loop::EventLoop,
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowBuilder},
 };
 
@@ -33,6 +35,7 @@ use crate::pipelines::PipelineLayout;
 pub mod ash_bootstrap;
 pub mod base_vulkan;
 pub mod buffers;
+pub mod camera;
 pub mod debug;
 pub mod descriptors;
 pub mod loader;
@@ -43,6 +46,7 @@ pub mod vk_imgui;
 const FRAME_OVERLAP: usize = 2;
 
 pub struct VulkanEngine {
+    camera: Camera,
     loaded_nodes: HashMap<String, Entity>,
     world: World,
     main_draw_context: DrawContext,
@@ -173,6 +177,7 @@ impl VulkanEngine {
             main_draw_context: DrawContext::new(),
             world: World::new(),
             loaded_nodes: HashMap::new(),
+            camera: Camera::new(glam::Vec3::new(0., 0., 5.), 0., 0.),
         }
     }
 
@@ -356,7 +361,9 @@ impl VulkanEngine {
     }
 
     pub fn update_scene(&mut self) {
-        evaluate_relative_transforms(&mut self.world);
+        //evaluate_relative_transforms(&mut self.world);
+
+        self.camera.update();
 
         self.main_draw_context.opaque_surfaces.clear();
 
@@ -383,21 +390,17 @@ impl VulkanEngine {
             );
         }
 
-        self.scene_data.view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(0., 0., -5.),
-            glam::Vec3::new(0., 0., 0.),
-            glam::Vec3::Y,
-        );
+        self.scene_data.view = self.camera.get_view_matrix();
 
-        self.scene_data.proj = glam::Mat4::perspective_rh_gl(
+        self.scene_data.proj = glam::Mat4::perspective_rh(
             70.,
             self.draw_extent.width as f32 / self.draw_extent.height as f32,
-            0.1,
             10000.,
+            0.1,
         );
         self.scene_data.proj.y_axis *= -1.;
 
-        self.scene_data.viewproj = self.scene_data.proj * self.scene_data.view; // * model;
+        self.scene_data.viewproj = self.scene_data.proj * self.scene_data.view;
 
         self.scene_data.ambientColor = glam::Vec4::ONE;
         self.scene_data.sunlightColor = glam::Vec4::ONE;
@@ -549,6 +552,27 @@ impl VulkanEngine {
                     event: WindowEvent::Resized(_new_size),
                 } => {
                     //self.framebuffer_resized = true;
+                }
+                Event::DeviceEvent {
+                    device_id,
+                    event:
+                        DeviceEvent::MouseMotion {
+                            delta: (delta_x, delta_y),
+                        },
+                } => {
+                    self.camera
+                        .process_mouse_input_event(delta_x as f32, delta_y as f32);
+                }
+                Event::WindowEvent {
+                    window_id,
+                    event:
+                        WindowEvent::KeyboardInput {
+                            device_id,
+                            event,
+                            is_synthetic,
+                        },
+                } => {
+                    self.camera.process_keyboard_input_event(event);
                 }
                 _ => (),
             }
